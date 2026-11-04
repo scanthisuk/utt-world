@@ -1,0 +1,1342 @@
+# Ultimate Transport Tycoon: builds every route in the world for the game, from OpenStreetMap.
+# Actions tab -> "Build world data" -> Run workflow. It starts with Great Britain; type "all" for the whole world.
+# Map data (c) OpenStreetMap contributors, ODbL. Sea from osmdata.openstreetmap.de.
+name: Build world data
+
+on:
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: 'Which regions (like great-britain or france, comma separated), or "all" for the whole world'
+        default: 'great-britain'
+        required: true
+  schedule:
+    - cron: '17 3 1 * *'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: world-data
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - id: plan
+        env:
+          REGIONS: ${{ github.event.inputs.regions || 'built' }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, subprocess, urllib.request
+          want = os.environ['REGIONS'].strip().lower()
+          req = urllib.request.Request('https://download.geofabrik.de/index-v1-nogeom.json',
+                                       headers={'User-Agent': 'utt-world-builder (GitHub Actions)'})
+          props = [f['properties'] for f in json.load(urllib.request.urlopen(req, timeout=180))['features']]
+          byid = {p['id']: p for p in props}
+          top = {p['id'] for p in props if not p.get('parent')}
+          # (combined extracts that would only repeat others)
+          skip = {'dach', 'alps', 'britain-and-ireland', 'united-kingdom', 'us-midwest', 'us-northeast',
+                  'us-pacific', 'us-south', 'us-west'}
+          if want in ('all', 'world'):
+              ids = [p['id'] for p in props if p.get('parent') in top and p['id'] not in skip]
+          elif want == 'built':
+              out = subprocess.run(['git', 'ls-remote', '--heads', 'https://github.com/' + os.environ['REPO']],
+                                   capture_output=True, text=True).stdout
+              ids = [ln.split('refs/heads/data-')[1] for ln in out.splitlines() if 'refs/heads/data-' in ln]
+          else:
+              ids = [w.strip() for w in want.split(',') if w.strip()]
+          inc, seen = [], set()
+          for i in ids:
+              p = byid.get(i)
+              if not p or i in seen or 'pbf' not in p.get('urls', {}):
+                  print('not a region I know:', i)
+                  continue
+              seen.add(i)
+              inc.append({'region': i, 'name': p.get('name', i), 'url': p['urls']['pbf']})
+          if len(inc) > 256:
+              print('more than 256 regions: building the first 256, run it again for the rest')
+              inc = inc[:256]
+          print(len(inc), 'regions:', ', '.join(x['region'] for x in inc))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('matrix=' + json.dumps({'include': inc}) + '\n')
+              f.write('count=' + str(len(inc)) + '\n')
+          EOF
+
+  sea:
+    runs-on: ubuntu-latest
+    steps:
+      - id: cache
+        uses: actions/cache@v4
+        with:
+          path: sea
+          key: water-polygons-v1
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p sea && cd sea
+          curl -sSfL --retry 3 -A "utt-world-builder (GitHub Actions)" -o water.zip \
+            https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip
+          unzip -q water.zip && rm water.zip
+          ls -la water-polygons-split-4326
+
+  region:
+    needs: [plan, sea]
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      REGION: ${{ matrix.region }}
+      REGION_NAME: ${{ matrix.name }}
+      REGION_URL: ${{ matrix.url }}
+    steps:
+      - name: Make room
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -q "osmium>=4.0" "shapely>=2.1" pyshp numpy
+      - uses: actions/cache/restore@v4
+        with:
+          path: sea
+          key: water-polygons-v1
+      - name: Download the map
+        run: |
+          curl -sSfL --retry 3 -A "utt-world-builder (GitHub Actions)" -o region.osm.pbf "$REGION_URL"
+          ls -la region.osm.pbf
+      - name: Build the routes
+        run: |
+          cat > world_build.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Ultimate Transport Tycoon - world data builder.
+
+          Reads one OpenStreetMap extract (.osm.pbf) and writes the files the game loads for that region:
+            meta.json            what's in the region (tiles, counts)
+            places.json          the places you complete (council areas), with outlines
+            towns.json           towns you can start in
+            t/<x>/<y>.json       detail tiles (zoom 12): stops, the routes calling at them, water, parks, roads
+            o/<x>/<y>.json       overview tiles (zoom 8): sea, lakes, forests, motorways
+            r/<nn>/<id>.json     one file per route: its stops in order and the shape between them
+          Map data (c) OpenStreetMap contributors, ODbL. Sea from osmdata.openstreetmap.de (ODbL).
+          """
+          import argparse
+          import json
+          import math
+          import os
+          import re
+          import time
+          from collections import Counter, defaultdict
+
+          import numpy as np
+          import osmium
+          import shapely
+          from shapely.geometry import LineString, Polygon, box
+          from shapely.strtree import STRtree
+
+          T0 = time.time()
+
+
+          def log(*a):
+              print(f'[{time.time() - T0:7.1f}s]', *a, flush=True)
+
+
+          TZ, OZ, EXT = 12, 8, 4096
+          ROUTE_MODES = {'bus': 'bus', 'trolleybus': 'bus', 'coach': 'bus', 'minibus': 'bus', 'tram': 'tram', 'funicular': 'tram',
+                         'light_rail': 'metro', 'subway': 'metro', 'monorail': 'metro', 'train': 'train', 'ferry': 'ferry'}
+          MODE_BIT = {'bus': 1, 'tram': 2, 'metro': 4, 'train': 8, 'ferry': 16}
+          STATION_BIT = 32
+          SKIP_WORDS = ('rail replacement', 'replacement bus', 'disused', 'test route', 'proposed', 'planned')
+          PALETTE = ['#FF4D4D', '#FF8A00', '#FFC400', '#3DCB4A', '#00BFA5', '#1EA7FF', '#4D6BFF', '#9B5CFF', '#FF4FC1', '#E0457B',
+                     '#14B8C8', '#FF6F3C', '#7AC70C', '#00A0E0', '#C86BFA', '#F2545B']
+          CSS = {'red': '#E32017', 'blue': '#0019A8', 'green': '#00782A', 'yellow': '#FFD300', 'orange': '#EE7C0E', 'purple': '#9B0056',
+                 'pink': '#F3A9BB', 'brown': '#B36305', 'black': '#333333', 'grey': '#A0A5A9', 'gray': '#A0A5A9', 'white': '#DDDDDD',
+                 'cyan': '#00A4A7', 'magenta': '#E5007E', 'navy': '#003688', 'lime': '#84B817', 'teal': '#00A4A7', 'maroon': '#8B1A1A',
+                 'gold': '#D4A017', 'violet': '#8F00FF', 'darkgreen': '#006400', 'darkblue': '#00008B', 'lightblue': '#6CB4EE',
+                 'darkred': '#8B0000', 'olive': '#808000', 'silver': '#C0C0C0', 'turquoise': '#40E0D0'}
+
+          # ---------------------------------------------------------------- helpers
+          def mercx(lon):
+              return (lon + 180.0) / 360.0
+
+
+          def mercy(lat):
+              lat = max(-85.05, min(85.05, lat))
+              s = math.sin(math.radians(lat))
+              return 0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)
+
+
+          def tile_of(lon, lat, z):
+              n = 1 << z
+              return int(mercx(lon) * n), int(mercy(lat) * n)
+
+
+          def tile_lonlat_box(x, y, z):
+              n = 1 << z
+              lon0 = x / n * 360.0 - 180.0
+              lon1 = (x + 1) / n * 360.0 - 180.0
+              lat0 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
+              lat1 = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+              return lon0, lat0, lon1, lat1
+
+
+          def to_tile_px(geom, x, y, z):
+              """lon/lat geometry -> that tile's local coordinates (0..EXT)"""
+              n = 1 << z
+
+              def f(c):
+                  lon, lat = c[:, 0], np.clip(c[:, 1], -85.05, 85.05)
+                  s = np.sin(np.radians(lat))
+                  my = 0.5 - np.log((1 + s) / (1 - s)) / (4 * math.pi)
+                  mx = (lon + 180.0) / 360.0
+                  return np.column_stack([(mx * n - x) * EXT, (my * n - y) * EXT])
+              return shapely.transform(geom, f)
+
+
+          def hav_km(a, b):
+              (lo1, la1), (lo2, la2) = a, b
+              p1, p2 = math.radians(la1), math.radians(la2)
+              dp, dl = p2 - p1, math.radians(lo2 - lo1)
+              h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+              return 2 * 6371.0 * math.asin(min(1.0, math.sqrt(h)))
+
+
+          def e5(v):
+              return int(round(v * 1e5))
+
+
+          def clean_name(n):
+              n = (n or '').strip()
+              for _ in range(2):
+                  n = re.sub(r'\s*[-(]?\s*(?:alighting|set down|setting down|drop off|arrivals?)( only)?\)?\s*$', '', n, flags=re.I)
+                  n = re.sub(r'\s*\((?:stop|stand|bay|platform|stance|gate)?\s*[A-Za-z]{0,2}\d{0,3}[A-Za-z]?\)\s*$', '', n, flags=re.I)
+                  n = re.sub(r'\s*[,-]?\s*(?:stop|stand|bay|platform|stance|gate)\s*[\w-]{1,3}$', '', n, flags=re.I)
+              n = re.sub(r'\s*/\s*$', '', n).strip(' -,/')
+              # (a stop code on the end of a normal name: Lime Street TE -> Lime Street)
+              m = re.match(r'^(.*[a-z].*\S)\s+([A-Z]{1,2}\d?)$', n)
+              if m and m.group(2) not in ('ST', 'RD', 'N', 'S', 'E', 'W', 'NE', 'NW', 'SE', 'SW', 'UK'):
+                  n = m.group(1)
+              # (names typed in capitals: Liverpool Road, not LIVERPOOL ROAD)
+              letters = [c for c in n if c.isalpha()]
+              if len(letters) > 3 and sum(c.isupper() for c in letters) / len(letters) > 0.8:
+                  # (and the stop's code on the end: JAMES ST JE -> James St)
+                  m = re.match(r'^(.*\S)\s+([A-Z]{1,2}\d?)$', n)
+                  if m and m.group(2) not in ('ST', 'RD', 'DR', 'LN', 'SQ', 'PL', 'CT', 'CL', 'GR', 'PK', 'AV', 'WY', 'HL', 'NE', 'NW', 'SE', 'SW', 'N', 'S', 'E', 'W'):
+                      n = m.group(1)
+                  n = re.sub(r"\b([A-Za-z])([A-Za-z']*)", lambda m: m.group(1).upper() + m.group(2).lower(), n)
+                  n = re.sub(r"'S\b", "'s", n)
+              return n
+
+
+          def name_key(n):
+              n = clean_name(n).lower()
+              n = re.sub(r'^(opp|opposite|adj|adjacent|o/s|outside|nr|near|o/p|before|after)\.?\s+', '', n)
+              n = re.sub(r'\b(railway station|train station|station|bus station|tram stop|stop)\b', ' ', n)
+              return re.sub(r'[^a-z0-9]+', '', n)
+
+
+          def colour_of(*vals):
+              for v in vals:
+                  v = (v or '').strip().lower().replace(' ', '')
+                  if not v:
+                      continue
+                  if re.fullmatch(r'#?[0-9a-f]{6}', v):
+                      return '#' + v.lstrip('#').upper()
+                  if re.fullmatch(r'#?[0-9a-f]{3}', v):
+                      h = v.lstrip('#')
+                      return '#' + ''.join(c * 2 for c in h).upper()
+                  if v in CSS:
+                      return CSS[v]
+              return None
+
+
+          def pick_colour(key):
+              h = 0
+              for ch in key:
+                  h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+              return PALETTE[h % len(PALETTE)]
+
+
+          def enc_deltas(pts):
+              """[(x, y), ...] ints -> [x0, y0, dx1, dy1, ...]"""
+              out, px, py = [], 0, 0
+              for x, y in pts:
+                  out.append(x - px); out.append(y - py)
+                  px, py = x, y
+              return out
+
+
+          class UF:
+              def __init__(self):
+                  self.p = {}
+
+              def find(self, a):
+                  p = self.p
+                  p.setdefault(a, a)
+                  while p[a] != a:
+                      p[a] = p[p[a]]
+                      a = p[a]
+                  return a
+
+              def union(self, a, b):
+                  ra, rb = self.find(a), self.find(b)
+                  if ra != rb:
+                      self.p[max(ra, rb)] = min(ra, rb)
+
+
+          # ---------------------------------------------------------------- step 1: keep only what the game needs
+          FILTER_PAIRS = [
+              ('type', 'route'), ('type', 'route_master'), ('public_transport', 'stop_area'), ('boundary', 'administrative'),
+              ('public_transport', 'stop_position'), ('public_transport', 'platform'), ('public_transport', 'station'),
+              ('highway', 'bus_stop'), ('railway', 'station'), ('railway', 'halt'), ('railway', 'tram_stop'), ('railway', 'stop'),
+              ('railway', 'platform'), ('amenity', 'ferry_terminal'), ('amenity', 'bus_station'),
+              ('place', 'city'), ('place', 'town'), ('place', 'village'),
+              ('natural', 'water'), ('waterway', 'riverbank'), ('waterway', 'river'), ('waterway', 'canal'), ('waterway', 'dock'),
+              ('landuse', 'reservoir'), ('landuse', 'basin'),
+              ('leisure', 'park'), ('leisure', 'garden'), ('leisure', 'nature_reserve'), ('leisure', 'golf_course'),
+              ('leisure', 'common'), ('leisure', 'recreation_ground'), ('landuse', 'forest'), ('landuse', 'recreation_ground'),
+              ('landuse', 'cemetery'), ('landuse', 'village_green'), ('natural', 'wood'),
+              ('natural', 'heath'), ('natural', 'beach'), ('natural', 'sand'),
+              ('highway', 'motorway'), ('highway', 'trunk'), ('highway', 'primary'), ('highway', 'secondary'),
+              ('railway', 'rail'), ('railway', 'light_rail'), ('railway', 'subway'), ('railway', 'tram'),
+              ('aeroway', 'aerodrome'),
+          ] + [('tourism', v) for v in ('attraction', 'museum', 'zoo', 'theme_park', 'gallery', 'aquarium')] + \
+              [('historic', 'castle'), ('historic', 'monument'), ('leisure', 'stadium'), ('building', 'cathedral')]
+          SIGHT_PAIRS = {('tourism', 'attraction'): 'sight', ('tourism', 'museum'): 'museum', ('tourism', 'zoo'): 'zoo',
+                         ('tourism', 'theme_park'): 'park', ('tourism', 'gallery'): 'museum', ('tourism', 'aquarium'): 'zoo',
+                         ('historic', 'castle'): 'castle', ('historic', 'monument'): 'sight', ('leisure', 'stadium'): 'stadium',
+                         ('building', 'cathedral'): 'church'}
+
+
+          def sight_kind(t):
+              if not t.get('name') or not t.get('wikidata'):
+                  return None
+              for (k, v), kind in SIGHT_PAIRS.items():
+                  if t.get(k) == v:
+                      return kind
+              return None
+          PLACE_NODE = {'city', 'town', 'village'}
+
+
+          def keep_filtered(o):
+              t = o.tags
+              if o.is_relation():
+                  ty = t.get('type')
+                  if ty == 'route':
+                      return t.get('route') in ROUTE_MODES
+                  if ty == 'route_master':
+                      return t.get('route_master') in ROUTE_MODES
+                  if t.get('public_transport') == 'stop_area':
+                      return True
+                  if t.get('boundary') == 'administrative':
+                      try:
+                          return 4 <= int(t.get('admin_level', '99')) <= 8
+                      except ValueError:
+                          return False
+                  return ty == 'multipolygon'
+              if o.is_node():
+                  if t.get('place') in PLACE_NODE or is_stopish(t) or sight_kind(t) or (t.get('aeroway') == 'aerodrome' and t.get('iata')):
+                      return True
+                  return False
+              # ways: everything matched (roads, rail, water, green, platforms)
+              return t.get('place') is None and t.get('boundary') is None
+
+
+          def filter_pbf(src, dst):
+              n = 0
+              with osmium.BackReferenceWriter(dst, ref_src=src, overwrite=True) as w:
+                  for o in osmium.FileProcessor(src).with_filter(osmium.filter.TagFilter(*FILTER_PAIRS)):
+                      if keep_filtered(o):
+                          w.add(o)
+                          n += 1
+              log('filtered', n, 'objects ->', dst, os.path.getsize(dst) // 1024, 'KB')
+
+
+          # ---------------------------------------------------------------- step 2: read it
+          WATER = {('natural', 'water'), ('waterway', 'riverbank'), ('waterway', 'dock'), ('landuse', 'reservoir'), ('landuse', 'basin')}
+          GREEN = {('leisure', 'park'), ('leisure', 'garden'), ('leisure', 'nature_reserve'), ('leisure', 'golf_course'),
+                   ('leisure', 'common'), ('leisure', 'recreation_ground'), ('landuse', 'forest'), ('landuse', 'recreation_ground'),
+                   ('landuse', 'cemetery'), ('landuse', 'village_green'), ('natural', 'wood'), ('natural', 'heath')}
+          SAND = {('natural', 'beach'), ('natural', 'sand')}
+          ROAD_CLASS = {'motorway': 1, 'trunk': 1, 'primary': 2, 'secondary': 3}
+          RAIL_CLASS = {'rail': 6, 'light_rail': 6, 'subway': 6, 'tram': 7}
+          RIVER_CLASS = {'river': 8, 'canal': 8}
+
+
+          def area_kind(t):
+              for k, v in t:
+                  if (k, v) in WATER:
+                      return 'w'
+              for k, v in t:
+                  if (k, v) in SAND:
+                      return 's'
+              for k, v in t:
+                  if (k, v) in GREEN:
+                      return 'g'
+              return None
+
+
+          class Reader:
+              def __init__(self):
+                  self.routes = {}          # relation id -> dict
+                  self.masters = {}         # route relation id -> master tags
+                  self.stop_areas = []      # (id, name, [('n', id) / ('w', id)])
+                  self.need_ways = set()    # route member ways (geometry) and platform ways
+                  self.need_nodes = set()   # nodes routes and stop areas list
+                  self.nodes = {}           # stop-ish node id -> (lon, lat, tags dict)
+                  self.way_geom = {}        # way id -> np.array (n, 2) lon/lat
+                  self.way_tags = {}        # platform ways -> tags
+                  self.towns = []           # (name, lon, lat, place, population)
+                  self.areas = {'w': [], 'g': [], 's': []}
+                  self.lines = []           # (class, shapely LineString lon/lat)
+                  self.admin = []           # (id, name, level, population, polygon)
+                  self.sights = []          # (name, lon, lat, kind)
+                  self.airports = []        # (iata, name, lon, lat)
+
+              def relations(self, path):
+                  for r in osmium.FileProcessor(path, osmium.osm.RELATION):
+                      t = dict(r.tags)
+                      ty = t.get('type')
+                      mem = [(m.type, m.ref, m.role) for m in r.members]
+                      if ty == 'route' and t.get('route') in ROUTE_MODES:
+                          self.routes[r.id] = {'id': r.id, 'tags': t, 'members': mem}
+                          for typ, ref, role in mem:
+                              if typ == 'w':
+                                  self.need_ways.add(ref)
+                              elif typ == 'n':
+                                  self.need_nodes.add(ref)
+                      elif ty == 'route_master':
+                          for typ, ref, role in mem:
+                              if typ == 'r':
+                                  self.masters[ref] = (r.id, t)
+                      elif t.get('public_transport') == 'stop_area':
+                          self.stop_areas.append((r.id, t.get('name', ''), [(typ, ref) for typ, ref, role in mem if typ in ('n', 'w')]))
+                          for typ, ref, role in mem:
+                              if typ == 'w':
+                                  self.need_ways.add(ref)
+                              elif typ == 'n':
+                                  self.need_nodes.add(ref)
+                  log('routes', len(self.routes), 'masters', len(set(m[0] for m in self.masters.values())), 'stop areas', len(self.stop_areas))
+
+              def everything(self, path):
+                  wkb = osmium.geom.WKBFactory()
+                  area_filter = osmium.filter.TagFilter(*(list(WATER) + list(GREEN) + list(SAND) + [('boundary', 'administrative'), ('aeroway', 'aerodrome')] +
+                                                          list(SIGHT_PAIRS)))
+                  fp = osmium.FileProcessor(path).with_locations().with_areas(area_filter)
+                  for o in fp:
+                      if o.is_node():
+                          t = o.tags
+                          if not o.location.valid():
+                              continue
+                          pl = t.get('place')
+                          if pl in PLACE_NODE:
+                              if t.get('name'):
+                                  pop = t.get('population', '')
+                                  pop = int(re.sub(r'[^0-9]', '', pop) or 0) if len(pop) < 12 else 0
+                                  self.towns.append((t.get('name'), o.location.lon, o.location.lat, pl, pop))
+                              continue
+                          sk = sight_kind(t)
+                          if sk:
+                              self.sights.append((t.get('name:en') or t.get('name'), o.location.lon, o.location.lat, sk))
+                          if t.get('aeroway') == 'aerodrome' and t.get('iata'):
+                              self.airports.append((t.get('iata'), t.get('name:en') or t.get('name') or t.get('iata'), o.location.lon, o.location.lat))
+                          if o.id in self.need_nodes or is_stopish(t):
+                              self.nodes[o.id] = (o.location.lon, o.location.lat, dict(t))
+                      elif o.is_way():
+                          t = o.tags
+                          hw, rw, ww = t.get('highway'), t.get('railway'), t.get('waterway')
+                          cls = ROAD_CLASS.get(hw) or RAIL_CLASS.get(rw) or RIVER_CLASS.get(ww)
+                          if o.id in self.need_ways or cls:
+                              try:
+                                  g = shapely.from_wkb(wkb.create_linestring(o))
+                              except Exception:
+                                  continue
+                              if o.id in self.need_ways:
+                                  self.way_geom[o.id] = shapely.get_coordinates(g)
+                                  if t.get('public_transport') == 'platform' or t.get('highway') == 'bus_stop' or t.get('railway') == 'platform':
+                                      self.way_tags[o.id] = dict(t)
+                              if cls and t.get('tunnel') not in ('yes', 'building_passage') and t.get('layer', '0') not in ('-1', '-2', '-3'):
+                                  if not (cls in (6, 7) and t.get('service')):
+                                      self.lines.append((cls, g))
+                      elif o.is_area():
+                          t = o.tags
+                          if t.get('boundary') == 'administrative' and not o.from_way():
+                              try:
+                                  lvl = int(t.get('admin_level', '99'))
+                              except ValueError:
+                                  continue
+                              if 4 <= lvl <= 8 and t.get('name'):
+                                  try:
+                                      g = shapely.from_wkb(wkb.create_multipolygon(o))
+                                  except Exception:
+                                      continue
+                                  pop = t.get('population', '')
+                                  pop = int(re.sub(r'[^0-9]', '', pop) or 0) if len(pop) < 12 else 0
+                                  self.admin.append((o.orig_id(), t.get('name:en') or t.get('name'), lvl, pop, g))
+                              continue
+                          sk = sight_kind(t)
+                          apt = t.get('aeroway') == 'aerodrome' and t.get('iata')
+                          if sk or apt:
+                              try:
+                                  c = shapely.from_wkb(wkb.create_multipolygon(o)).representative_point()
+                                  if sk:
+                                      self.sights.append((t.get('name:en') or t.get('name'), c.x, c.y, sk))
+                                  if apt:
+                                      self.airports.append((t.get('iata'), t.get('name:en') or t.get('name') or t.get('iata'), c.x, c.y))
+                              except Exception:
+                                  pass
+                              if not area_kind(list(t)):
+                                  continue
+                          k = area_kind(list(t))
+                          if not k:
+                              continue
+                          try:
+                              g = shapely.from_wkb(wkb.create_multipolygon(o))
+                          except Exception:
+                              continue
+                          # (skip the tiny ones: about 0.3 ha at 50 degrees north)
+                          b = g.bounds
+                          if (b[2] - b[0]) * (b[3] - b[1]) < 3e-8:
+                              continue
+                          self.areas[k].append(g)
+                  log('nodes', len(self.nodes), 'route ways', len(self.way_geom), 'towns', len(self.towns),
+                      'water', len(self.areas['w']), 'green', len(self.areas['g']), 'lines', len(self.lines), 'admin', len(self.admin),
+                      'sights', len(self.sights), 'airports', len(self.airports))
+
+
+          # ---------------------------------------------------------------- step 3: stops
+          def is_stopish(t):
+              return (t.get('public_transport') in ('stop_position', 'platform', 'station') or t.get('highway') == 'bus_stop' or
+                      t.get('railway') in ('station', 'halt', 'tram_stop', 'stop', 'platform') or t.get('amenity') in ('ferry_terminal', 'bus_station'))
+
+
+          def is_station(t):
+              return t.get('public_transport') == 'station' or t.get('railway') in ('station', 'halt') or \
+                  t.get('amenity') in ('bus_station', 'ferry_terminal')
+
+
+          def build_stops(R):
+              """every stop-ish thing -> one game stop (both sides of the road, the platforms of a station...)"""
+              el = {}   # key -> (lon, lat, name, tags)
+              for nid, (lon, lat, t) in R.nodes.items():
+                  if is_stopish(t):
+                      el[('n', nid)] = (lon, lat, t.get('name', ''), t)
+              for wid, t in R.way_tags.items():
+                  c = R.way_geom.get(wid)
+                  if c is not None and len(c):
+                      el[('w', wid)] = (float(c[:, 0].mean()), float(c[:, 1].mean()), t.get('name', ''), t)
+              uf = UF()
+              for k in el:
+                  uf.find(k)
+              # stop areas group a station's (or a stop's) bits
+              sa_name = {}
+              for sid, nm, mem in R.stop_areas:
+                  keys = [m for m in mem if m in el]
+                  for k in keys[1:]:
+                      uf.union(keys[0], k)
+                  for k in keys:
+                      if nm:
+                          sa_name[k] = nm
+              # same name, close by: one stop (bus 70 m, rail/tram/ferry 350 m)
+              cell = 0.0035
+              grid = defaultdict(list)
+              for k, (lon, lat, nm, t) in el.items():
+                  grid[(int(lon / cell), int(lat / cell))].append(k)
+              for k, (lon, lat, nm, t) in el.items():
+                  key = name_key(sa_name.get(k) or nm)
+                  railish = t.get('railway') in ('station', 'halt', 'platform', 'stop') or t.get('train') == 'yes' or \
+                      t.get('subway') == 'yes' or t.get('light_rail') == 'yes' or t.get('public_transport') == 'station' or \
+                      t.get('amenity') == 'ferry_terminal' or t.get('tram') == 'yes' or t.get('railway') == 'tram_stop'
+                  low = clean_name(sa_name.get(k) or nm).lower()
+                  big = any(w in low for w in ('bus station', 'interchange', 'bus hub', 'coach station', 'bus terminal'))
+                  lim = 0.35 if railish else 0.25 if big else 0.12
+                  gx, gy = int(lon / cell), int(lat / cell)
+                  reach = 2 if (railish or big) else 1
+                  for dx in range(-reach, reach + 1):
+                      for dy in range(-reach, reach + 1):
+                          for k2 in grid.get((gx + dx, gy + dy), ()):
+                              if k2 <= k:
+                                  continue
+                              lon2, lat2, nm2, t2 = el[k2]
+                              key2 = name_key(sa_name.get(k2) or nm2)
+                              d = hav_km((lon, lat), (lon2, lat2))
+                              if key and key == key2 and d <= lim:
+                                  uf.union(k, k2)
+                              elif (not key or not key2) and d <= 0.025:
+                                  uf.union(k, k2)
+              groups = defaultdict(list)
+              for k in el:
+                  groups[uf.find(k)].append(k)
+              stop_of = {}
+              stops = {}
+              for root, keys in groups.items():
+                  def rank(k):
+                      t = el[k][3]
+                      return (0 if is_station(t) else 1 if t.get('public_transport') == 'platform' or t.get('highway') == 'bus_stop' else 2,
+                              0 if el[k][2] else 1, k[1])
+                  keys.sort(key=rank)
+                  best = keys[0]
+                  names = [clean_name(sa_name.get(k) or el[k][2]) for k in keys if (sa_name.get(k) or el[k][2])]
+                  t0 = el[best][3]
+                  if is_station(t0) and t0.get('name'):
+                      name = clean_name(t0['name'])
+                  elif names:
+                      name = Counter(names).most_common(1)[0][0]
+                  else:
+                      name = ''
+                  if is_station(t0):
+                      lon, lat = el[best][0], el[best][1]
+                  else:
+                      lon = sum(el[k][0] for k in keys) / len(keys)
+                      lat = sum(el[k][1] for k in keys) / len(keys)
+                  sid = ('n' if best[0] == 'n' else 'w') + str(best[1])
+                  stops[sid] = {'id': sid, 'lon': lon, 'lat': lat, 'name': name, 'station': is_station(t0), 'modes': 0, 'routes': []}
+                  for k in keys:
+                      stop_of[k] = sid
+              log('stop elements', len(el), '-> stops', len(stops))
+              return stops, stop_of
+
+
+          # ---------------------------------------------------------------- step 4: routes
+          GEOM_ROLES = ('', 'forward', 'backward', 'main', 'hail_and_ride', 'alternative')
+
+
+          def local_proj(lat0):
+              kx, ky = 111.320 * math.cos(math.radians(lat0)), 110.574
+              return kx, ky
+
+
+          def chain_of(R, rel):
+              ways = []
+              for typ, ref, role in rel['members']:
+                  if typ == 'w' and role in GEOM_ROLES:
+                      c = R.way_geom.get(ref)
+                      if c is not None and len(c) >= 2:
+                          ways.append([(float(x), float(y)) for x, y in c])
+              if not ways:
+                  return []
+
+              def d2(a, b):
+                  return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+              chain, ring_start = [], None
+              for idx, pts in enumerate(ways):
+                  closed = len(pts) > 3 and d2(pts[0], pts[-1]) < 1e-14
+                  if not chain:
+                      if not closed and idx + 1 < len(ways):
+                          nxt = ways[idx + 1]
+                          if min(d2(pts[0], nxt[0]), d2(pts[0], nxt[-1])) < min(d2(pts[-1], nxt[0]), d2(pts[-1], nxt[-1])):
+                              pts = pts[::-1]
+                      chain = list(pts)
+                      ring_start = 0 if closed else None
+                      continue
+                  if ring_start is not None:
+                      best = None
+                      for k in range(ring_start, len(chain)):
+                          for end, rev in ((pts[0], False), (pts[-1], True)):
+                              dd = d2(chain[k], end)
+                              if best is None or dd < best[0]:
+                                  best = (dd, k, rev)
+                      _, k, rev = best
+                      del chain[k + 1:]
+                      if rev:
+                          pts = pts[::-1]
+                      ring_start = None
+                  elif d2(chain[-1], pts[-1]) < d2(chain[-1], pts[0]):
+                      pts = pts[::-1]
+                  if closed:
+                      k = min(range(len(pts) - 1), key=lambda i: d2(pts[i], chain[-1]))
+                      ring = pts[k:-1] + pts[:k + 1]
+                      ring_start = len(chain)
+                      chain += ring
+                  else:
+                      chain += pts[1:] if d2(chain[-1], pts[0]) < 1e-14 else pts
+              return chain
+
+
+          def project_along(xy, pxy, start_s):
+              """closest point of the polyline xy (n, 2 km) to pxy at arc length >= start_s -> (s, dist, point)"""
+              a = xy[:-1]
+              d = xy[1:] - a
+              L = np.hypot(d[:, 0], d[:, 1])
+              cum = np.concatenate([[0.0], np.cumsum(L)])
+              L2 = np.maximum(L * L, 1e-18)
+              t = ((pxy[0] - a[:, 0]) * d[:, 0] + (pxy[1] - a[:, 1]) * d[:, 1]) / L2
+              t = np.clip(t, 0.0, 1.0)
+              tmin = np.clip((start_s - cum[:-1]) / np.maximum(L, 1e-18), 0.0, 1.0)
+              t = np.maximum(t, tmin)
+              ok = cum[1:] >= start_s - 1e-9
+              qx = a[:, 0] + t * d[:, 0]
+              qy = a[:, 1] + t * d[:, 1]
+              dd = np.where(ok, np.hypot(pxy[0] - qx, pxy[1] - qy), 1e18)
+              k = int(np.argmin(dd))
+              return float(cum[k] + t[k] * L[k]), float(dd[k]), cum
+
+
+          def piece(xy, cum, s0, s1):
+              """the polyline between arc lengths s0 and s1"""
+              if s1 <= s0:
+                  return []
+              i0 = int(np.searchsorted(cum, s0, side='right'))
+              i1 = int(np.searchsorted(cum, s1, side='left'))
+              return [tuple(p) for p in xy[i0:i1]]
+
+
+          def route_ends(t):
+              fr, to = t.get('from'), t.get('to')
+              if fr and to:
+                  return fr, to
+              nm = t.get('name', '')
+              m = re.search(r':\s*(.+?)\s*(?:=>|->|→|<=>|↔| - | – | to )\s*(.+)$', nm)
+              if m:
+                  return m.group(1), re.sub(r'\s+via\s+.*$', '', m.group(2), flags=re.I)
+              return None, None
+
+
+          def build_routes(R, stops, stop_of):
+              out = []
+              loose = None
+              for rid, rel in R.routes.items():
+                  t = rel['tags']
+                  mode = ROUTE_MODES[t['route']]
+                  nm = (t.get('name', '') + ' ' + t.get('description', '')).lower()
+                  if any(w in nm for w in SKIP_WORDS) or t.get('disused') == 'yes' or t.get('state') in ('proposed', 'disused'):
+                      continue
+                  # stops in order: the stop positions, or else the platforms
+                  seq_s, seq_p = [], []
+                  for typ, ref, role in rel['members']:
+                      if typ not in ('n', 'w'):
+                          continue
+                      k = (typ, ref)
+                      sid = stop_of.get(k)
+                      if not sid:
+                          continue
+                      if role.startswith('stop'):
+                          seq_s.append(sid)
+                      elif role.startswith('platform'):
+                          seq_p.append(sid)
+                  seq = seq_s if len(set(seq_s)) >= 2 else seq_p
+                  dedup = []
+                  for s in seq:
+                      if not dedup or dedup[-1] != s:
+                          dedup.append(s)
+                  seq = dedup
+                  chain = chain_of(R, rel)
+                  if len(chain) >= 2 and t['route'] in ('bus', 'trolleybus', 'minibus', 'tram'):
+                      # (lots of bus routes only list their two ends: then it's the stops it passes on the way)
+                      run = sum(hav_km(chain[i - 1], chain[i]) for i in range(1, len(chain)))
+                      if run / max(1, len(seq) - 1) > 1.0:
+                          if loose is None:
+                              loose = defaultdict(list)
+                              for s in stops.values():
+                                  loose[(int(s['lon'] / 0.003), int(s['lat'] / 0.003))].append(s)
+                          along = stops_along(chain, loose, [stops[x] for x in seq])
+                          # (the way the relation lists its stops is the way it goes)
+                          if len(seq) >= 2 and seq[0] in along and seq[-1] in along and along.index(seq[0]) > along.index(seq[-1]):
+                              along.reverse()
+                          if len(along) > len(seq):
+                              seq = []
+                              for sid in along:
+                                  if not seq or seq[-1] != sid:
+                                      seq.append(sid)
+                  # (the same stop twice in a row: both sides of the road, or stands at a bus station)
+                  tidy = []
+                  for sid in seq:
+                      if tidy:
+                          a, b = stops[tidy[-1]], stops[sid]
+                          d = hav_km((a['lon'], a['lat']), (b['lon'], b['lat']))
+                          if d < 0.1 or (d < 0.5 and name_key(a['name']) and name_key(a['name']) == name_key(b['name'])):
+                              continue
+                      tidy.append(sid)
+                  seq = tidy
+                  if len(set(seq)) < 2:
+                      continue
+                  lat0 = stops[seq[0]]['lat']
+                  kx, ky = local_proj(lat0)
+
+                  def P(lon, lat):
+                      return (lon * kx, lat * ky)
+                  segs = [[] for _ in seq]
+                  if len(chain) >= 2:
+                      xy = np.array([P(lon, lat) for lon, lat in chain])
+                      s_prev, svals, dists = 0.0, [], []
+                      cum = None
+                      for sid in seq:
+                          st = stops[sid]
+                          s, d, cum = project_along(xy, P(st['lon'], st['lat']), s_prev)
+                          if d > 0.3:
+                              s = s_prev
+                          svals.append(s)
+                          dists.append(d)
+                          s_prev = s
+                      for i in range(1, len(seq)):
+                          if dists[i] > 0.3 or dists[i - 1] > 0.3:
+                              continue
+                          pts = piece(xy, cum, svals[i - 1], svals[i])
+                          segs[i] = [(x / kx, y / ky) for x, y in pts]
+                  # (simplify each piece: about 4 m)
+                  km = [0.0]
+                  enc = [[]]
+                  for i in range(1, len(seq)):
+                      a, b = stops[seq[i - 1]], stops[seq[i]]
+                      pts = [(a['lon'], a['lat'])] + segs[i] + [(b['lon'], b['lat'])]
+                      if len(pts) > 2:
+                          ls = LineString([P(*p) for p in pts]).simplify(0.004)
+                          pts = [(x / kx, y / ky) for x, y in ls.coords]
+                      L = sum(hav_km(pts[j - 1], pts[j]) for j in range(1, len(pts)))
+                      km.append(round(max(L, 0.01), 3))
+                      mid = pts[1:-1]
+                      ints = [(e5(p[1]), e5(p[0])) for p in mid]
+                      start = (e5(a['lat']), e5(a['lon']))
+                      flat, px, py = [], start[0], start[1]
+                      for x, y in ints:
+                          flat += [x - px, y - py]
+                          px, py = x, y
+                      enc.append(flat)
+                  m = R.masters.get(rid)
+                  mt = m[1] if m else {}
+                  ref = (t.get('ref') or mt.get('ref') or '').strip()
+                  fr, to = route_ends(t)
+                  first, last = stops[seq[0]]['name'], stops[seq[-1]]['name']
+                  if not fr or not to:
+                      fr, to = first or fr, last or to
+                  name = f'{clean_name(fr)} - {clean_name(to)}' if fr and to and clean_name(fr) != clean_name(to) else \
+                      (clean_name(fr) + ' circular' if fr else (t.get('name') or mt.get('name') or ref or 'Route'))
+                  col = colour_of(t.get('colour'), mt.get('colour')) or pick_colour(mode + ':' + (ref or name))
+                  out.append({'id': 'r' + str(rid), 'rid': rid, 'mode': mode, 'ref': ref[:8], 'name': name[:60], 'col': col,
+                              'op': (t.get('operator') or mt.get('operator') or '')[:40], 'net': (t.get('network') or mt.get('network') or '')[:40],
+                              'master': m[0] if m else None, 'stops': seq, 'g': enc, 'km': km, 'total': sum(km)})
+              log('routes with at least two stops', len(out))
+              return out
+
+
+          def stops_along(chain, grid, extra=()):
+              lat0 = chain[0][1]
+              kx, ky = local_proj(lat0)
+              xy = np.array([(lon * kx, lat * ky) for lon, lat in chain])
+              seen, cand = set(), []
+              for lon, lat in chain[::2]:
+                  gx, gy = int(lon / 0.003), int(lat / 0.003)
+                  for dx in (-1, 0, 1):
+                      for dy in (-1, 0, 1):
+                          for s in grid.get((gx + dx, gy + dy), ()):
+                              if s['id'] not in seen:
+                                  seen.add(s['id'])
+                                  cand.append(s)
+              along = []
+              must = set(s['id'] for s in extra)
+              for s in list(extra) + [c for c in cand if c['id'] not in must]:
+                  sv, d, _ = project_along(xy, (s['lon'] * kx, s['lat'] * ky), 0.0)
+                  if d <= 0.035 or (s['id'] in must and d <= 0.4):
+                      along.append((sv, s['id']))
+              along.sort()
+              out = []
+              for _, sid in along:
+                  if not out or out[-1] != sid:
+                      out.append(sid)
+              return out
+
+
+          def pick_routes(routes):
+              """one route per real route (its longest direction), plus any branch that's really different"""
+              groups = defaultdict(list)
+              for r in routes:
+                  if r['master']:
+                      key = ('m', r['master'])
+                  elif r['ref']:
+                      key = ('r', r['mode'], r['ref'].upper(), r['net'] or r['op'])
+                  else:
+                      key = ('n', r['mode'], r['name'])
+                  groups[key].append(r)
+              keep = []
+              for key, rs in groups.items():
+                  rs.sort(key=lambda r: (-len(r['stops']), -r['total'], r['rid']))
+                  kept = []
+                  for r in rs:
+                      s = set(r['stops'])
+                      if any(len(s & set(k['stops'])) / max(1, len(s)) >= 0.5 for k in kept):
+                          continue
+                      kept.append(r)
+                  keep += kept
+              log('routes after merging directions', len(keep), 'from', len(routes))
+              return keep
+
+
+          # ---------------------------------------------------------------- step 5: places (council areas)
+          def build_places(R, stops):
+              adm = [a for a in R.admin if a[4] is not None and not a[4].is_empty]
+              if not adm:
+                  log('no council areas found')
+                  return [], {}
+              polys = [a[4] for a in adm]
+              tree = STRtree(polys)
+              ids = list(stops)
+              pts = shapely.points([stops[s]['lon'] for s in ids], [stops[s]['lat'] for s in ids])
+              pi, ai = tree.query(pts, predicate='within')
+              best = {}
+              for p, a in zip(pi.tolist(), ai.tolist()):
+                  lvl = adm[a][2]
+                  if p not in best or lvl > adm[best[p]][2]:
+                      best[p] = a
+              place_of = {}
+              used = defaultdict(int)
+              for p, a in best.items():
+                  place_of[ids[p]] = 'a' + str(adm[a][0])
+                  used[a] += 1
+              # (stops just outside every area: the nearest one within 3 km)
+              miss = [i for i in range(len(ids)) if i not in best]
+              if miss:
+                  near = tree.query_nearest(pts[miss], max_distance=0.03, return_distance=False)
+                  for k, a in zip(near[0].tolist(), near[1].tolist()):
+                      p = miss[k]
+                      if ids[p] not in place_of:
+                          place_of[ids[p]] = 'a' + str(adm[a][0])
+                          used[a] += 1
+              out = []
+              for a, n in used.items():
+                  aid, name, lvl, pop, g = adm[a]
+                  out.append({'id': 'a' + str(aid), 'name': name, 'level': lvl, 'pop': pop, 'geom': g, 'stops': 0, 'routes': 0})
+              log('places', len(out), 'stops placed', len(place_of), 'of', len(ids))
+              return out, place_of
+
+
+          def enc_rings(geom, tol):
+              try:
+                  g = shapely.make_valid(geom).simplify(tol, preserve_topology=True)
+              except Exception:
+                  return []
+              rings = []
+              for poly in getattr(g, 'geoms', [g]):
+                  if poly.is_empty or poly.geom_type != 'Polygon':
+                      continue
+                  c = list(poly.exterior.coords)[:-1]
+                  if len(c) < 3:
+                      continue
+                  rings.append(enc_deltas([(e5(lat), e5(lon)) for lon, lat in c]))
+              return rings
+
+
+          # ---------------------------------------------------------------- step 6: the sea
+          def load_sea(path, bbox):
+              """water polygons (osmdata.openstreetmap.de, EPSG:4326) inside bbox"""
+              if not path or not os.path.exists(path):
+                  log('no sea polygons file: no sea')
+                  return []
+              import shapefile
+              rd = shapefile.Reader(path)
+              out = []
+              bb = box(*bbox)
+              try:
+                  shapes = rd.iterShapes(bbox=list(bbox))
+              except TypeError:
+                  shapes = rd.iterShapes()
+              for sh in shapes:
+                  b = sh.bbox
+                  if b[2] < bbox[0] or b[0] > bbox[2] or b[3] < bbox[1] or b[1] > bbox[3]:
+                      continue
+                  g = shapely.geometry.shape(sh.__geo_interface__)
+                  if not g.is_valid:
+                      g = g.buffer(0)
+                  g = g.intersection(bb)
+                  if not g.is_empty:
+                      out.append(g)
+              log('sea pieces', len(out))
+              return out
+
+
+          # ---------------------------------------------------------------- step 7: tiles
+          def tri_flat(geom):
+              """polygon(s) in tile coords -> flat triangle coords [x1, y1, x2, y2, x3, y3, ...]"""
+              out = []
+              if geom.is_empty:
+                  return out
+              for poly in getattr(geom, 'geoms', [geom]):
+                  if poly.geom_type != 'Polygon' or poly.is_empty or poly.area < 1:
+                      continue
+                  try:
+                      tris = shapely.constrained_delaunay_triangles(poly)
+                  except Exception:
+                      continue
+                  for tr in getattr(tris, 'geoms', []):
+                      c = list(tr.exterior.coords)[:3]
+                      if len(c) < 3:
+                          continue
+                      q = [(int(round(x)), int(round(y))) for x, y in c]
+                      # (no slivers)
+                      if abs((q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[2][0] - q[0][0]) * (q[1][1] - q[0][1])) < 2:
+                          continue
+                      out.append(q)
+              # [x1 - last x1, y1 - last y1, x2 - x1, y2 - y1, x3 - x1, y3 - y1, ...]
+              flat, lx, ly = [], 0, 0
+              for (x1, y1), (x2, y2), (x3, y3) in out:
+                  flat += [x1 - lx, y1 - ly, x2 - x1, y2 - y1, x3 - x1, y3 - y1]
+                  lx, ly = x1, y1
+              return flat
+
+
+          def layer_tris(geoms, x, y, z, tol, min_area):
+              if not geoms:
+                  return []
+              lon0, lat0, lon1, lat1 = tile_lonlat_box(x, y, z)
+              bb = box(lon0, lat0, lon1, lat1)
+              parts = []
+              for g in geoms:
+                  try:
+                      c = g.intersection(bb)
+                  except Exception:
+                      try:
+                          c = shapely.make_valid(g).intersection(bb)
+                      except Exception:
+                          continue
+                  if not c.is_empty:
+                      parts.append(c)
+              if not parts:
+                  return []
+              px = [to_tile_px(p, x, y, z) for p in parts]
+              try:
+                  u = shapely.union_all(px)
+              except Exception:
+                  u = shapely.union_all([shapely.make_valid(p).buffer(0) for p in px])
+              u = u.intersection(box(0, 0, EXT, EXT)).simplify(tol, preserve_topology=True)
+              if u.geom_type == 'GeometryCollection':
+                  u = shapely.MultiPolygon([p for p in u.geoms if p.geom_type == 'Polygon'] +
+                                           [q for p in u.geoms if p.geom_type == 'MultiPolygon' for q in p.geoms])
+              keep = [p for p in getattr(u, 'geoms', [u]) if p.geom_type == 'Polygon' and p.area >= min_area]
+              return tri_flat(shapely.MultiPolygon(keep) if len(keep) > 1 else (keep[0] if keep else Polygon()))
+
+
+          def layer_lines(items, x, y, z, tol, classes):
+              out = []
+              lon0, lat0, lon1, lat1 = tile_lonlat_box(x, y, z)
+              bb = box(lon0, lat0, lon1, lat1)
+              for cls, g in items:
+                  if cls not in classes:
+                      continue
+                  try:
+                      c = g.intersection(bb)
+                  except Exception:
+                      continue
+                  if c.is_empty:
+                      continue
+                  c = to_tile_px(c, x, y, z).simplify(tol)
+                  for ls in getattr(c, 'geoms', [c]):
+                      if ls.geom_type != 'LineString' or ls.length < 3:
+                          continue
+                      pts = [(int(round(px)), int(round(py))) for px, py in ls.coords]
+                      out.append([cls] + enc_deltas(pts))
+              return out
+
+
+          def bucket(geoms, z, with_cls=False):
+              """which tiles each shape touches"""
+              b = defaultdict(list)
+              for item in geoms:
+                  g = item[1] if with_cls else item
+                  x0, y0, x1, y1 = g.bounds
+                  tx0, ty1 = tile_of(x0, y0, z)
+                  tx1, ty0 = tile_of(x1, y1, z)
+                  if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) > 4000:
+                      continue
+                  for tx in range(tx0, tx1 + 1):
+                      for ty in range(ty0, ty1 + 1):
+                          b[(tx, ty)].append(item)
+              return b
+
+
+          def write_json(path, obj):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, 'w', encoding='utf-8') as f:
+                  json.dump(obj, f, ensure_ascii=False, separators=(',', ':'))
+
+
+          # ---------------------------------------------------------------- main
+          def main():
+              ap = argparse.ArgumentParser()
+              ap.add_argument('--pbf', required=True)
+              ap.add_argument('--region', required=True)
+              ap.add_argument('--name', default='')
+              ap.add_argument('--out', required=True)
+              ap.add_argument('--sea', default='')
+              ap.add_argument('--keep-filtered', action='store_true')
+              a = ap.parse_args()
+              out = os.path.join(a.out, a.region)
+              os.makedirs(out, exist_ok=True)
+              filtered = os.path.join(a.out, a.region + '.filtered.pbf')
+              filter_pbf(a.pbf, filtered)
+              R = Reader()
+              R.relations(filtered)
+              R.everything(filtered)
+              if not a.keep_filtered:
+                  os.remove(filtered)
+
+              stops, stop_of = build_stops(R)
+              routes = pick_routes(build_routes(R, stops, stop_of))
+              used = set()
+              for r in routes:
+                  for i, sid in enumerate(r['stops']):
+                      st = stops[sid]
+                      st['modes'] |= MODE_BIT[r['mode']]
+                      if r['id'] not in st['routes']:
+                          st['routes'].append(r['id'])
+                      used.add(sid)
+              stops = {k: v for k, v in stops.items() if k in used}
+              for s in stops.values():
+                  if s['station']:
+                      s['modes'] |= STATION_BIT
+              log('stops with routes', len(stops))
+              if not stops:
+                  write_json(os.path.join(out, 'meta.json'), {'v': 1, 'region': a.region, 'name': a.name, 'empty': True})
+                  return
+              places, place_of = build_places(R, stops)
+              pl_by = {p['id']: p for p in places}
+              for sid, s in stops.items():
+                  s['place'] = place_of.get(sid, '')
+                  if s['place']:
+                      pl_by[s['place']]['stops'] += 1
+              for r in routes:
+                  hp = stops[r['stops'][0]].get('place')
+                  if hp:
+                      pl_by[hp]['routes'] += 1
+
+              # routes
+              rinfo = {}
+              for r in routes:
+                  rinfo[r['id']] = r
+                  doc = {'v': 1, 'id': r['id'], 'mode': r['mode'], 'ref': r['ref'], 'name': r['name'], 'col': r['col'], 'op': r['op'],
+                         's': [[sid, e5(stops[sid]['lat']), e5(stops[sid]['lon']), stops[sid]['name'], stops[sid]['place']] for sid in r['stops']],
+                         'g': r['g'], 'km': r['km']}
+                  write_json(os.path.join(out, 'r', f"{r['rid'] % 100:02d}", r['id'] + '.json'), doc)
+              log('wrote routes', len(routes))
+
+              # places
+              pdoc = []
+              for p in places:
+                  b = p['geom'].bounds
+                  pdoc.append([p['id'], p['name'], p['level'], p['pop'], p['stops'], p['routes'],
+                               [e5(b[1]), e5(b[0]), e5(b[3]), e5(b[2])], enc_rings(p['geom'], 0.0003), enc_rings(p['geom'], 0.003)])
+              write_json(os.path.join(out, 'places.json'), {'v': 1, 'p': pdoc})
+
+              # towns you can start in (with at least 3 routes within 2 km)
+              grid = defaultdict(list)
+              for s in stops.values():
+                  grid[(int(s['lon'] / 0.02), int(s['lat'] / 0.02))].append(s)
+              tdoc = []
+              for name, lon, lat, kind, pop in R.towns:
+                  rs = set()
+                  gx, gy = int(lon / 0.02), int(lat / 0.02)
+                  for dx in (-1, 0, 1):
+                      for dy in (-1, 0, 1):
+                          for s in grid.get((gx + dx, gy + dy), ()):
+                              if hav_km((lon, lat), (s['lon'], s['lat'])) <= 2.0:
+                                  rs.update(s['routes'])
+                  if len(rs) >= 3:
+                      near = min(grid.get((gx, gy), []) or [None], key=lambda s: hav_km((lon, lat), (s['lon'], s['lat'])) if s else 0)
+                      tdoc.append([name, e5(lat), e5(lon), pop, {'city': 3, 'town': 2, 'village': 1}[kind], len(rs),
+                                   (near or {}).get('place', '')])
+              tdoc.sort(key=lambda t: (-t[4], -t[3], t[0]))
+              write_json(os.path.join(out, 'towns.json'), {'v': 1, 't': tdoc})
+              log('towns', len(tdoc))
+
+              # detail tiles: every tile with stops, and the ones around them
+              by_tile = defaultdict(list)
+              for s in stops.values():
+                  by_tile[tile_of(s['lon'], s['lat'], TZ)].append(s)
+              want = set()
+              for (x, y) in by_tile:
+                  for dx in (-1, 0, 1):
+                      for dy in (-1, 0, 1):
+                          want.add((x + dx, y + dy))
+              lon_min = min(s['lon'] for s in stops.values()) - 0.1
+              lon_max = max(s['lon'] for s in stops.values()) + 0.1
+              lat_min = min(s['lat'] for s in stops.values()) - 0.1
+              lat_max = max(s['lat'] for s in stops.values()) + 0.1
+              sea = load_sea(a.sea, (lon_min, lat_min, lon_max, lat_max))
+              water = R.areas['w'] + sea
+              bw, bg, bs = bucket(water, TZ), bucket(R.areas['g'], TZ), bucket(R.areas['s'], TZ)
+              bl = bucket(R.lines, TZ, with_cls=True)
+              sights_by_tile = defaultdict(list)
+              seen_s = set()
+              for nm, lon, lat, kind in R.sights:
+                  key = (nm, round(lon, 3), round(lat, 3))
+                  if key in seen_s:
+                      continue
+                  seen_s.add(key)
+                  t = tile_of(lon, lat, TZ)
+                  if t in want:
+                      sights_by_tile[t].append((nm[:50], lon, lat, kind))
+              apts, seen_a = [], set()
+              for iata, nm, lon, lat in R.airports:
+                  if iata in seen_a or not re.fullmatch(r'[A-Z]{3}', iata or ''):
+                      continue
+                  seen_a.add(iata)
+                  apts.append([iata, nm[:60], e5(lat), e5(lon)])
+              write_json(os.path.join(out, 'airports.json'), {'v': 1, 'a': apts})
+              log('airports', len(apts), 'sights', len(seen_s))
+              tiles = []
+              nbytes = 0
+              for (x, y) in sorted(want):
+                  doc = {'v': 1, 'x': x, 'y': y}
+                  ss = by_tile.get((x, y), [])
+                  if ss:
+                      rids = []
+                      ridx = {}
+                      for s in ss:
+                          for rid in s['routes']:
+                              if rid not in ridx:
+                                  ridx[rid] = len(rids)
+                                  rids.append(rid)
+                      doc['r'] = [[rid, rinfo[rid]['mode'], rinfo[rid]['ref'], rinfo[rid]['name'], rinfo[rid]['col'],
+                                   len(rinfo[rid]['stops']), round(rinfo[rid]['total'], 1)] for rid in rids]
+                      n = 1 << TZ
+                      doc['s'] = []
+                      pidx, plist = {}, []
+                      for s in sorted(ss, key=lambda s: s['id']):
+                          lx = int(round((mercx(s['lon']) * n - x) * EXT))
+                          ly = int(round((mercy(s['lat']) * n - y) * EXT))
+                          if s['place'] not in pidx:
+                              pidx[s['place']] = len(plist)
+                              plist.append(s['place'])
+                          doc['s'].append([s['id'], lx, ly, s['name'], s['modes'], pidx[s['place']], [ridx[r] for r in s['routes']]])
+                      doc['p'] = plist
+                  try:
+                      doc['w'] = layer_tris(bw.get((x, y)), x, y, TZ, 3.0, 60)
+                      doc['g'] = layer_tris(bg.get((x, y)), x, y, TZ, 5.0, 1500)
+                      doc['b'] = layer_tris(bs.get((x, y)), x, y, TZ, 4.0, 1000)
+                      doc['l'] = layer_lines(bl.get((x, y), []), x, y, TZ, 3.0, {1, 2, 3, 6, 8})
+                  except Exception as e:
+                      log('  map for tile', x, y, 'failed:', e)
+                      doc['w'], doc['g'], doc['b'], doc['l'] = [], [], [], []
+                  ks = sights_by_tile.get((x, y), [])
+                  if ks:
+                      n = 1 << TZ
+                      doc['k'] = [[nm, int(round((mercx(lon) * n - x) * EXT)), int(round((mercy(lat) * n - y) * EXT)), kind] for nm, lon, lat, kind in ks]
+                  if not (ss or ks or doc['w'] or doc['g'] or doc['l']):
+                      continue
+                  p = os.path.join(out, 't', str(x), f'{y}.json')
+                  write_json(p, doc)
+                  nbytes += os.path.getsize(p)
+                  tiles.append([x, y, 1 if ss else 0])
+              log('detail tiles', len(tiles), 'MB', round(nbytes / 1e6, 1))
+
+              # overview tiles
+              big_w = [g for g in water if (lambda b: (b[2] - b[0]) * (b[3] - b[1]))(g.bounds) > 2e-5] + sea
+              big_g = [g for g in R.areas['g'] if (lambda b: (b[2] - b[0]) * (b[3] - b[1]))(g.bounds) > 2e-4]
+              big_l = [it for it in R.lines if it[0] in (1, 6)]
+              ow, og, ol = bucket(big_w, OZ), bucket(big_g, OZ), bucket(big_l, OZ, with_cls=True)
+              otiles = []
+              for (x, y) in sorted(set(tile_of(s['lon'], s['lat'], OZ) for s in stops.values()) | set(ow) | set(og)):
+                  try:
+                      doc = {'v': 1, 'x': x, 'y': y, 'z': OZ,
+                             'w': layer_tris(ow.get((x, y)), x, y, OZ, 2.0, 40),
+                             'g': layer_tris(og.get((x, y)), x, y, OZ, 3.0, 400),
+                             'l': layer_lines(ol.get((x, y), []), x, y, OZ, 2.0, {1, 6})}
+                  except Exception as e:
+                      log('  overview tile', x, y, 'failed:', e)
+                      continue
+                  if doc['w'] or doc['g'] or doc['l']:
+                      write_json(os.path.join(out, 'o', str(x), f'{y}.json'), doc)
+                      otiles.append([x, y])
+              log('overview tiles', len(otiles))
+
+              bb = [e5(lat_min + 0.1), e5(lon_min + 0.1), e5(lat_max - 0.1), e5(lon_max - 0.1)]
+              write_json(os.path.join(out, 'meta.json'), {
+                  'v': 1, 'region': a.region, 'name': a.name or a.region, 'built': time.strftime('%Y-%m-%d'), 'bbox': bb,
+                  'tz': TZ, 'oz': OZ, 'ext': EXT, 't': tiles, 'o': otiles,
+                  'counts': {'routes': len(routes), 'stops': len(stops), 'places': len(places), 'towns': len(tdoc),
+                             'modes': dict(Counter(r['mode'] for r in routes))}})
+              log('done', a.region)
+
+
+          if __name__ == '__main__':
+              main()
+          PYEOF
+          python3 world_build.py --pbf region.osm.pbf --region "$REGION" --name "$REGION_NAME" --out out \
+            --sea sea/water-polygons-split-4326/water_polygons.shp
+      - name: Save them
+        env:
+          TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cd "out/$REGION"
+          git init -q
+          git checkout -q --orphan "data-$REGION"
+          git add -A
+          git -c user.name="world builder" -c user.email="actions@users.noreply.github.com" commit -q -m "$REGION_NAME $(date -u +%F)"
+          git push -q -f "https://x-access-token:${TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/data-$REGION"
+
+  publish:
+    needs: [plan, region]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Collect every region
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          mkdir -p site tmp
+          for b in $(git ls-remote --heads "https://github.com/$REPO" 'data-*' | sed 's#.*refs/heads/##'); do
+            r="${b#data-}"
+            git clone -q --depth 1 --branch "$b" "https://github.com/$REPO.git" "tmp/$r"
+            rm -rf "tmp/$r/.git"
+            mv "tmp/$r" "site/$r"
+          done
+          du -sh site
+      - name: Write the index
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'EOF'
+          import glob, json, os, shutil, time
+          repo = os.environ['REPO']
+          regions, towns = [], []
+          sizes = {}
+          for meta in sorted(glob.glob('site/*/meta.json')):
+              r = os.path.basename(os.path.dirname(meta))
+              m = json.load(open(meta))
+              if m.get('empty'):
+                  continue
+              total = 0
+              for root, dirs, files in os.walk('site/' + r):
+                  total += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+              sizes[r] = total
+              regions.append({'id': r, 'name': m.get('name', r), 'bbox': m['bbox'], 'built': m.get('built'),
+                              'counts': m.get('counts', {}), 'path': r + '/'})
+          # (a Pages site can hold 1 GB: the biggest regions past that load straight from their branch)
+          budget = 900e6
+          for reg in sorted(regions, key=lambda x: sizes[x['id']]):
+              if sizes[reg['id']] <= budget:
+                  budget -= sizes[reg['id']]
+              else:
+                  reg['base'] = 'https://raw.githubusercontent.com/' + repo + '/data-' + reg['id'] + '/'
+          for i, reg in enumerate(regions):
+              for t in json.load(open('site/' + reg['id'] + '/towns.json'))['t']:
+                  towns.append(t[:6] + [i, t[6]])
+              if reg.get('base'):
+                  keep = {'meta.json', 'towns.json', 'places.json'}
+                  for f in os.listdir('site/' + reg['id']):
+                      if f not in keep:
+                          p = 'site/' + reg['id'] + '/' + f
+                          shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+          towns.sort(key=lambda t: t[0].lower())
+          json.dump({'v': 1, 'built': time.strftime('%Y-%m-%d'), 'attribution': 'Map data (c) OpenStreetMap contributors',
+                     'regions': regions}, open('site/index.json', 'w'), separators=(',', ':'))
+          json.dump({'v': 1, 't': towns}, open('site/towns.json', 'w'), ensure_ascii=False, separators=(',', ':'))
+          print(len(regions), 'regions,', len(towns), 'towns')
+          EOF
+          du -sh site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
