@@ -1,6 +1,6 @@
 # Ultimate Transport Tycoon: builds every route in the world for the game, from OpenStreetMap.
 # Actions tab -> "Build world data" -> Run workflow. It starts with Great Britain; type "all" for the whole world.
-# Map data (c) OpenStreetMap contributors, ODbL. Sea from osmdata.openstreetmap.de.
+# Map data (c) OpenStreetMap contributors, ODbL.
 name: Build world data
 
 on:
@@ -70,24 +70,8 @@ jobs:
               f.write('count=' + str(len(inc)) + '\n')
           EOF
 
-  sea:
-    runs-on: ubuntu-latest
-    steps:
-      - id: cache
-        uses: actions/cache@v4
-        with:
-          path: sea
-          key: water-polygons-v1
-      - if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p sea && cd sea
-          curl -sSfL --retry 3 -A "utt-world-builder (GitHub Actions)" -o water.zip \
-            https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip
-          unzip -q water.zip && rm water.zip
-          ls -la water-polygons-split-4326
-
   region:
-    needs: [plan, sea]
+    needs: plan
     if: needs.plan.outputs.count != '0'
     runs-on: ubuntu-latest
     timeout-minutes: 340
@@ -105,11 +89,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install -q "osmium>=4.0" "shapely>=2.1" pyshp numpy
-      - uses: actions/cache/restore@v4
-        with:
-          path: sea
-          key: water-polygons-v1
+      - run: pip install -q "osmium>=4.0" "shapely>=2.1" pyshp numpy scipy
       - name: Download the map
         run: |
           curl -sSfL --retry 3 -A "utt-world-builder (GitHub Actions)" -o region.osm.pbf "$REGION_URL"
@@ -127,7 +107,7 @@ jobs:
             t/<x>/<y>.json       detail tiles (zoom 12): stops, the routes calling at them, water, parks, roads
             o/<x>/<y>.json       overview tiles (zoom 8): sea, lakes, forests, motorways
             r/<nn>/<id>.json     one file per route: its stops in order and the shape between them
-          Map data (c) OpenStreetMap contributors, ODbL. Sea from osmdata.openstreetmap.de (ODbL).
+          Map data (c) OpenStreetMap contributors, ODbL. The sea comes from the coastline in the same data.
           """
           import argparse
           import json
@@ -140,6 +120,7 @@ jobs:
           import numpy as np
           import osmium
           import shapely
+          import shapely.ops
           from shapely.geometry import LineString, Polygon, box
           from shapely.strtree import STRtree
 
@@ -308,7 +289,7 @@ jobs:
               ('natural', 'heath'), ('natural', 'beach'), ('natural', 'sand'),
               ('highway', 'motorway'), ('highway', 'trunk'), ('highway', 'primary'), ('highway', 'secondary'),
               ('railway', 'rail'), ('railway', 'light_rail'), ('railway', 'subway'), ('railway', 'tram'),
-              ('aeroway', 'aerodrome'),
+              ('aeroway', 'aerodrome'), ('natural', 'coastline'),
           ] + [('tourism', v) for v in ('attraction', 'museum', 'zoo', 'theme_park', 'gallery', 'aquarium')] + \
               [('historic', 'castle'), ('historic', 'monument'), ('leisure', 'stadium'), ('building', 'cathedral')]
           SIGHT_PAIRS = {('tourism', 'attraction'): 'sight', ('tourism', 'museum'): 'museum', ('tourism', 'zoo'): 'zoo',
@@ -400,6 +381,7 @@ jobs:
                   self.lines = []           # (class, shapely LineString lon/lat)
                   self.admin = []           # (id, name, level, population, polygon)
                   self.sights = []          # (name, lon, lat, kind)
+                  self.coast = []           # coastline ways (land on their left), np arrays lon/lat
                   self.airports = []        # (iata, name, lon, lat)
 
               def relations(self, path):
@@ -454,6 +436,13 @@ jobs:
                       elif o.is_way():
                           t = o.tags
                           hw, rw, ww = t.get('highway'), t.get('railway'), t.get('waterway')
+                          if t.get('natural') == 'coastline':
+                              try:
+                                  c = shapely.get_coordinates(shapely.from_wkb(wkb.create_linestring(o)))
+                                  if len(c) >= 2:
+                                      self.coast.append(c)
+                              except Exception:
+                                  pass
                           cls = ROAD_CLASS.get(hw) or RAIL_CLASS.get(rw) or RIVER_CLASS.get(ww)
                           if o.id in self.need_ways or cls:
                               try:
@@ -510,7 +499,7 @@ jobs:
                           self.areas[k].append(g)
                   log('nodes', len(self.nodes), 'route ways', len(self.way_geom), 'towns', len(self.towns),
                       'water', len(self.areas['w']), 'green', len(self.areas['g']), 'lines', len(self.lines), 'admin', len(self.admin),
-                      'sights', len(self.sights), 'airports', len(self.airports))
+                      'sights', len(self.sights), 'airports', len(self.airports), 'coastline ways', len(self.coast))
 
 
           # ---------------------------------------------------------------- step 3: stops
@@ -952,6 +941,116 @@ jobs:
               return out
 
 
+          class Sea:
+              """the sea, worked out from the coastline (OpenStreetMap draws it with the land on its left)"""
+
+              def __init__(self, ways):
+                  self.ways = ways
+                  self.lines = [LineString(c) for c in ways]
+                  self.tree = STRtree(self.lines) if self.lines else None
+                  # points just either side of the whole coastline: land on the left, sea on the right
+                  self.kd = None
+                  if ways:
+                      from scipy.spatial import cKDTree
+                      P, L = self._sides(ways)
+                      if P is not None:
+                          self.kx = math.cos(math.radians(float(np.median(P[:, 1]))))
+                          self.kd = cKDTree(np.column_stack([P[:, 0] * self.kx, P[:, 1]]))
+                          self.klab = L
+
+              @staticmethod
+              def _sides(ways, bounds=None):
+                  pts, lab = [], []
+                  for c in ways:
+                      a, b = c[:-1], c[1:]
+                      m = (a + b) / 2
+                      if bounds is not None:
+                          x0, y0, x1, y1 = bounds
+                          ok = (m[:, 0] >= x0) & (m[:, 0] <= x1) & (m[:, 1] >= y0) & (m[:, 1] <= y1)
+                          if not ok.any():
+                              continue
+                          a, b, m = a[ok], b[ok], m[ok]
+                      k = math.cos(math.radians(float(m[0, 1])))
+                      dx, dy = (b[:, 0] - a[:, 0]) * k, b[:, 1] - a[:, 1]
+                      L = np.hypot(dx, dy)
+                      good = L > 1e-9
+                      if not good.any():
+                          continue
+                      dx, dy, m = dx[good] / L[good], dy[good] / L[good], m[good]
+                      e = 2.5e-5
+                      for sgn, label in ((1, 0), (-1, 1)):
+                          pts.append(np.column_stack([m[:, 0] - sgn * dy * e / k, m[:, 1] + sgn * dx * e]))
+                          lab.append(np.full(len(m), label))
+                  if not pts:
+                      return None, None
+                  return np.concatenate(pts), np.concatenate(lab)
+
+              def _side_samples(self, idx, bb, limit=800):
+                  P, Lb = self._sides([self.ways[i] for i in idx], bb.bounds)
+                  if P is not None and len(P) > limit:
+                      pick = np.linspace(0, len(P) - 1, limit).astype(int)
+                      P, Lb = P[pick], Lb[pick]
+                  return P, Lb
+
+              def _nearest_is_sea(self, pt):
+                  """which side of the coastline is this? (the closest point just beside the coastline says)"""
+                  if self.kd is None:
+                      return False
+                  _, j = self.kd.query([pt.x * self.kx, pt.y])
+                  return bool(self.klab[int(j)] == 1)
+
+              def in_box(self, bb):
+                  if self.tree is None:
+                      return []
+                  idx = self.tree.query(bb)
+                  if len(idx) == 0:
+                      return [bb] if self._nearest_is_sea(bb.centroid) else []
+                  pieces = []
+                  for i in idx:
+                      try:
+                          g = self.lines[i].intersection(bb)
+                      except Exception:
+                          continue
+                      if not g.is_empty:
+                          pieces.append(g)
+                  if not pieces:
+                      return [bb] if self._nearest_is_sea(bb.centroid) else []
+                  net = shapely.union_all(pieces + [bb.boundary])
+                  # (the coastline stops where the map data stops: carry its loose ends to the edge of the box)
+                  ends = Counter()
+                  for ls in getattr(net, 'geoms', [net]):
+                      if ls.geom_type == 'LineString' and len(ls.coords) >= 2:
+                          ends[tuple(np.round(ls.coords[0], 9))] += 1
+                          ends[tuple(np.round(ls.coords[-1], 9))] += 1
+                  extra = []
+                  for pt, n in ends.items():
+                      if n == 1:
+                          p = shapely.Point(pt)
+                          if bb.boundary.distance(p) > 1e-9:
+                              q = shapely.ops.nearest_points(p, bb.boundary)[1]
+                              extra.append(LineString([pt, (q.x, q.y)]))
+                  if extra:
+                      net = shapely.union_all([net] + extra)
+                  faces = [f for f in shapely.get_parts(shapely.polygonize([net])) if f.area > 0]
+                  if not faces:
+                      return []
+                  P, Lb = self._side_samples(idx, bb)
+                  out = []
+                  for f in faces:
+                      if P is None:
+                          sea = self._nearest_is_sea(f.representative_point())
+                      else:
+                          inside = shapely.contains_xy(f, P[:, 0], P[:, 1])
+                          ns, nl = int((Lb[inside] == 1).sum()), int((Lb[inside] == 0).sum())
+                          if ns + nl == 0:
+                              sea = self._nearest_is_sea(f.representative_point())
+                          else:
+                              sea = ns > nl
+                      if sea:
+                          out.append(f)
+                  return out
+
+
           # ---------------------------------------------------------------- step 7: tiles
           def tri_flat(geom):
               """polygon(s) in tile coords -> flat triangle coords [x1, y1, x2, y2, x3, y3, ...]"""
@@ -1158,7 +1257,8 @@ jobs:
               lon_max = max(s['lon'] for s in stops.values()) + 0.1
               lat_min = min(s['lat'] for s in stops.values()) - 0.1
               lat_max = max(s['lat'] for s in stops.values()) + 0.1
-              sea = load_sea(a.sea, (lon_min, lat_min, lon_max, lat_max))
+              sea = load_sea(a.sea, (lon_min, lat_min, lon_max, lat_max)) if a.sea else []
+              coast = Sea(R.coast) if not sea else Sea([])
               water = R.areas['w'] + sea
               bw, bg, bs = bucket(water, TZ), bucket(R.areas['g'], TZ), bucket(R.areas['s'], TZ)
               bl = bucket(R.lines, TZ, with_cls=True)
@@ -1207,7 +1307,7 @@ jobs:
                           doc['s'].append([s['id'], lx, ly, s['name'], s['modes'], pidx[s['place']], [ridx[r] for r in s['routes']]])
                       doc['p'] = plist
                   try:
-                      doc['w'] = layer_tris(bw.get((x, y)), x, y, TZ, 3.0, 60)
+                      doc['w'] = layer_tris(bw.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, TZ))), x, y, TZ, 3.0, 60)
                       doc['g'] = layer_tris(bg.get((x, y)), x, y, TZ, 5.0, 1500)
                       doc['b'] = layer_tris(bs.get((x, y)), x, y, TZ, 4.0, 1000)
                       doc['l'] = layer_lines(bl.get((x, y), []), x, y, TZ, 3.0, {1, 2, 3, 6, 8})
@@ -1232,10 +1332,13 @@ jobs:
               big_l = [it for it in R.lines if it[0] in (1, 6)]
               ow, og, ol = bucket(big_w, OZ), bucket(big_g, OZ), bucket(big_l, OZ, with_cls=True)
               otiles = []
-              for (x, y) in sorted(set(tile_of(s['lon'], s['lat'], OZ) for s in stops.values()) | set(ow) | set(og)):
+              ox0, oy1 = tile_of(lon_min, lat_min, OZ)
+              ox1, oy0 = tile_of(lon_max, lat_max, OZ)
+              oall = {(x, y) for x in range(ox0, ox1 + 1) for y in range(oy0, oy1 + 1)}
+              for (x, y) in sorted(oall | set(tile_of(s['lon'], s['lat'], OZ) for s in stops.values())):
                   try:
                       doc = {'v': 1, 'x': x, 'y': y, 'z': OZ,
-                             'w': layer_tris(ow.get((x, y)), x, y, OZ, 2.0, 40),
+                             'w': layer_tris(ow.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, OZ))), x, y, OZ, 2.0, 40),
                              'g': layer_tris(og.get((x, y)), x, y, OZ, 3.0, 400),
                              'l': layer_lines(ol.get((x, y), []), x, y, OZ, 2.0, {1, 6})}
                   except Exception as e:
@@ -1258,8 +1361,7 @@ jobs:
           if __name__ == '__main__':
               main()
           PYEOF
-          python3 world_build.py --pbf region.osm.pbf --region "$REGION" --name "$REGION_NAME" --out out \
-            --sea sea/water-polygons-split-4326/water_polygons.shp
+          python3 world_build.py --pbf region.osm.pbf --region "$REGION" --name "$REGION_NAME" --out out
       - name: Save them
         env:
           TOKEN: ${{ github.token }}
