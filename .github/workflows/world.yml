@@ -93,7 +93,9 @@ jobs:
       - name: Download the map
         run: |
           curl -sSfL --retry 3 -A "utt-world-builder (GitHub Actions)" -o region.osm.pbf "$REGION_URL"
-          ls -la region.osm.pbf
+          # (the edge of the extract: the sea is only worked out inside it)
+          curl -sSfL --retry 3 -A "utt-world-builder (GitHub Actions)" -o region.poly "${REGION_URL%-latest.osm.pbf}.poly" || rm -f region.poly
+          ls -la region.osm.pbf region.poly || true
       - name: Build the routes
         run: |
           cat > world_build.py <<'PYEOF'
@@ -291,10 +293,10 @@ jobs:
               ('railway', 'rail'), ('railway', 'light_rail'), ('railway', 'subway'), ('railway', 'tram'),
               ('aeroway', 'aerodrome'), ('natural', 'coastline'),
           ] + [('tourism', v) for v in ('attraction', 'museum', 'zoo', 'theme_park', 'gallery', 'aquarium')] + \
-              [('historic', 'castle'), ('historic', 'monument'), ('leisure', 'stadium'), ('building', 'cathedral')]
+              [('historic', 'castle'), ('leisure', 'stadium'), ('building', 'cathedral')]
           SIGHT_PAIRS = {('tourism', 'attraction'): 'sight', ('tourism', 'museum'): 'museum', ('tourism', 'zoo'): 'zoo',
                          ('tourism', 'theme_park'): 'park', ('tourism', 'gallery'): 'museum', ('tourism', 'aquarium'): 'zoo',
-                         ('historic', 'castle'): 'castle', ('historic', 'monument'): 'sight', ('leisure', 'stadium'): 'stadium',
+                         ('historic', 'castle'): 'castle', ('leisure', 'stadium'): 'stadium',
                          ('building', 'cathedral'): 'church'}
 
 
@@ -800,7 +802,7 @@ jobs:
                   name = f'{clean_name(fr)} - {clean_name(to)}' if fr and to and clean_name(fr) != clean_name(to) else \
                       (clean_name(fr) + ' circular' if fr else (t.get('name') or mt.get('name') or ref or 'Route'))
                   col = colour_of(t.get('colour'), mt.get('colour')) or pick_colour(mode + ':' + (ref or name))
-                  out.append({'id': 'r' + str(rid), 'rid': rid, 'mode': mode, 'ref': ref[:8], 'name': name[:60], 'col': col,
+                  out.append({'id': 'r' + str(rid), 'rid': rid, 'mode': mode, 'ref': ref[:12], 'name': name[:60], 'col': col,
                               'op': (t.get('operator') or mt.get('operator') or '')[:40], 'net': (t.get('network') or mt.get('network') or '')[:40],
                               'master': m[0] if m else None, 'stops': seq, 'g': enc, 'km': km, 'total': sum(km)})
               log('routes with at least two stops', len(out))
@@ -914,6 +916,33 @@ jobs:
 
 
           # ---------------------------------------------------------------- step 6: the sea
+          def load_poly(path):
+              """the edge of the map extract (Geofabrik's .poly file: outer rings, and holes marked with !)"""
+              shells, holes = [], []
+              with open(path) as f:
+                  lines = [ln.strip() for ln in f if ln.strip()]
+              i = 1
+              while i < len(lines):
+                  head = lines[i]
+                  if head == 'END':
+                      break
+                  pts = []
+                  i += 1
+                  while i < len(lines) and lines[i] != 'END':
+                      parts = lines[i].split()
+                      pts.append((float(parts[0]), float(parts[1])))
+                      i += 1
+                  i += 1
+                  if len(pts) >= 3:
+                      (holes if head.startswith('!') else shells).append(Polygon(pts).buffer(0))
+              if not shells:
+                  return None
+              g = shapely.union_all(shells)
+              if holes:
+                  g = g.difference(shapely.union_all(holes))
+              return g
+
+
           def load_sea(path, bbox):
               """water polygons (osmdata.openstreetmap.de, EPSG:4326) inside bbox"""
               if not path or not os.path.exists(path):
@@ -944,8 +973,12 @@ jobs:
           class Sea:
               """the sea, worked out from the coastline (OpenStreetMap draws it with the land on its left)"""
 
-              def __init__(self, ways):
+              def __init__(self, ways, edge=None):
                   self.ways = ways
+                  # (only inside the edge of the map extract: past it, there's no coastline to go by)
+                  self.edge = edge
+                  if edge is not None:
+                      shapely.prepare(edge)
                   self.lines = [LineString(c) for c in ways]
                   self.tree = STRtree(self.lines) if self.lines else None
                   # points just either side of the whole coastline: land on the left, sea on the right
@@ -1000,6 +1033,22 @@ jobs:
                   return bool(self.klab[int(j)] == 1)
 
               def in_box(self, bb):
+                  out = self._in_box(bb)
+                  if self.edge is None or not out:
+                      return out
+                  if self.edge.contains(bb):
+                      return out
+                  clipped = []
+                  for f in out:
+                      try:
+                          g = f.intersection(self.edge)
+                      except Exception:
+                          continue
+                      if not g.is_empty:
+                          clipped += [q for q in shapely.get_parts(g) if q.geom_type == 'Polygon' and q.area > 0]
+                  return clipped
+
+              def _in_box(self, bb):
                   if self.tree is None:
                       return []
                   idx = self.tree.query(bb)
@@ -1079,6 +1128,120 @@ jobs:
                   flat += [x1 - lx, y1 - ly, x2 - x1, y2 - y1, x3 - x1, y3 - y1]
                   lx, ly = x1, y1
               return flat
+
+
+          CH = 4                      # chunks across a tile
+          CW = EXT // CH
+
+
+          def chunked_tris(u, min_area):
+              """a (multi)polygon in tile coords -> [[chunk, triangles...], ...]"""
+              out = []
+              if u is None or u.is_empty:
+                  return out
+              for cy in range(CH):
+                  for cx in range(CH):
+                      cb = box(cx * CW, cy * CW, (cx + 1) * CW, (cy + 1) * CW)
+                      try:
+                          part = u.intersection(cb)
+                      except Exception:
+                          continue
+                      if part.is_empty:
+                          continue
+                      polys = [p for p in getattr(part, 'geoms', [part]) if p.geom_type == 'Polygon' and p.area >= 1]
+                      if not polys:
+                          continue
+                      flat = tri_flat(shapely.MultiPolygon(polys) if len(polys) > 1 else polys[0])
+                      if flat:
+                          out.append([cy * CH + cx] + flat)
+              return out
+
+
+          def budget_tris(u, tol, min_area, budget):
+              """simplify more and more until the tile's shapes are at most `budget` triangles (chunky, and cheap to draw)"""
+              if u is None:
+                  return []
+              for k in range(6):
+                  t = tol * (1.6 ** k)
+                  m = min_area * (1.8 ** k)
+                  g = u.simplify(t, preserve_topology=True)
+                  keep = [p for p in shapely.get_parts(g) if p.geom_type == 'Polygon' and p.area >= m]
+                  if not keep:
+                      return []
+                  out = chunked_tris(shapely.MultiPolygon(keep) if len(keep) > 1 else keep[0], 1)
+                  n = sum((len(c) - 1) // 6 for c in out)
+                  if n <= budget:
+                      return out
+              return out
+
+
+          def layer_shape(geoms, x, y, z, tol, min_area, merge=0.0):
+              """water/green/sand inside a tile, merged, simplified, small bits dropped (tile coords)"""
+              if not geoms:
+                  return None
+              lon0, lat0, lon1, lat1 = tile_lonlat_box(x, y, z)
+              bb = box(lon0, lat0, lon1, lat1)
+              parts = []
+              for g in geoms:
+                  try:
+                      c = g.intersection(bb)
+                  except Exception:
+                      try:
+                          c = shapely.make_valid(g).intersection(bb)
+                      except Exception:
+                          continue
+                  if not c.is_empty:
+                      parts.append(c)
+              if not parts:
+                  return None
+              px = [to_tile_px(p, x, y, z) for p in parts]
+              try:
+                  u = shapely.union_all(px)
+              except Exception:
+                  u = shapely.union_all([shapely.make_valid(p).buffer(0) for p in px])
+              if merge > 0:
+                  u = u.buffer(merge, quad_segs=2).buffer(-merge, quad_segs=2)
+              u = u.intersection(box(0, 0, EXT, EXT)).simplify(tol, preserve_topology=True)
+              keep = [p for p in shapely.get_parts(u) if p.geom_type == 'Polygon' and p.area >= min_area]
+              if not keep:
+                  return None
+              return shapely.MultiPolygon(keep) if len(keep) > 1 else keep[0]
+
+
+          def chunked_lines(items, x, y, z, tol, classes):
+              """roads/rivers inside a tile: joined up into long lines, simplified -> [[chunk, class, deltas...], ...]"""
+              lon0, lat0, lon1, lat1 = tile_lonlat_box(x, y, z)
+              bb = box(lon0, lat0, lon1, lat1)
+              by_cls = defaultdict(list)
+              for cls, g in items:
+                  if cls not in classes:
+                      continue
+                  try:
+                      c = g.intersection(bb)
+                  except Exception:
+                      continue
+                  if not c.is_empty:
+                      by_cls[cls].append(to_tile_px(c, x, y, z))
+              out = []
+              for cls, gs in sorted(by_cls.items()):
+                  try:
+                      merged = shapely.line_merge(shapely.union_all(gs))
+                  except Exception:
+                      merged = shapely.MultiLineString([q for g in gs for q in shapely.get_parts(g) if q.geom_type == 'LineString'])
+                  merged = merged.simplify(tol)
+                  for cy in range(CH):
+                      for cx in range(CH):
+                          cb = box(cx * CW - 2, cy * CW - 2, (cx + 1) * CW + 2, (cy + 1) * CW + 2)
+                          try:
+                              part = merged.intersection(cb)
+                          except Exception:
+                              continue
+                          for ls in shapely.get_parts(part):
+                              if ls.geom_type != 'LineString' or ls.length < 4:
+                                  continue
+                              pts = [(int(round(px)), int(round(py))) for px, py in ls.coords]
+                              out.append([cy * CH + cx, cls] + enc_deltas(pts))
+              return out
 
 
           def layer_tris(geoms, x, y, z, tol, min_area):
@@ -1164,6 +1327,7 @@ jobs:
               ap.add_argument('--name', default='')
               ap.add_argument('--out', required=True)
               ap.add_argument('--sea', default='')
+              ap.add_argument('--poly', default='')
               ap.add_argument('--keep-filtered', action='store_true')
               a = ap.parse_args()
               out = os.path.join(a.out, a.region)
@@ -1209,8 +1373,9 @@ jobs:
               rinfo = {}
               for r in routes:
                   rinfo[r['id']] = r
-                  doc = {'v': 1, 'id': r['id'], 'mode': r['mode'], 'ref': r['ref'], 'name': r['name'], 'col': r['col'], 'op': r['op'],
-                         's': [[sid, e5(stops[sid]['lat']), e5(stops[sid]['lon']), stops[sid]['name'], stops[sid]['place']] for sid in r['stops']],
+                  doc = {'v': 2, 'id': r['id'], 'mode': r['mode'], 'ref': r['ref'], 'name': r['name'], 'col': r['col'], 'op': r['op'],
+                         's': [[sid, e5(stops[sid]['lat']), e5(stops[sid]['lon']), stops[sid]['name'], stops[sid]['place'],
+                                len(stops[sid]['routes']), stops[sid]['modes']] for sid in r['stops']],
                          'g': r['g'], 'km': r['km']}
                   write_json(os.path.join(out, 'r', f"{r['rid'] % 100:02d}", r['id'] + '.json'), doc)
               log('wrote routes', len(routes))
@@ -1258,7 +1423,14 @@ jobs:
               lat_min = min(s['lat'] for s in stops.values()) - 0.1
               lat_max = max(s['lat'] for s in stops.values()) + 0.1
               sea = load_sea(a.sea, (lon_min, lat_min, lon_max, lat_max)) if a.sea else []
-              coast = Sea(R.coast) if not sea else Sea([])
+              edge = None
+              if a.poly and os.path.exists(a.poly):
+                  try:
+                      edge = load_poly(a.poly)
+                      log('extract edge', a.poly, 'area', round(edge.area, 3) if edge is not None else None)
+                  except Exception as e:
+                      log('  could not read', a.poly, e)
+              coast = Sea(R.coast, edge) if not sea else Sea([])
               water = R.areas['w'] + sea
               bw, bg, bs = bucket(water, TZ), bucket(R.areas['g'], TZ), bucket(R.areas['s'], TZ)
               bl = bucket(R.lines, TZ, with_cls=True)
@@ -1283,7 +1455,7 @@ jobs:
               tiles = []
               nbytes = 0
               for (x, y) in sorted(want):
-                  doc = {'v': 1, 'x': x, 'y': y}
+                  doc = {'v': 2, 'x': x, 'y': y}
                   ss = by_tile.get((x, y), [])
                   if ss:
                       rids = []
@@ -1307,10 +1479,10 @@ jobs:
                           doc['s'].append([s['id'], lx, ly, s['name'], s['modes'], pidx[s['place']], [ridx[r] for r in s['routes']]])
                       doc['p'] = plist
                   try:
-                      doc['w'] = layer_tris(bw.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, TZ))), x, y, TZ, 3.0, 60)
-                      doc['g'] = layer_tris(bg.get((x, y)), x, y, TZ, 5.0, 1500)
-                      doc['b'] = layer_tris(bs.get((x, y)), x, y, TZ, 4.0, 1000)
-                      doc['l'] = layer_lines(bl.get((x, y), []), x, y, TZ, 3.0, {1, 2, 3, 6, 8})
+                      doc['w'] = budget_tris(layer_shape(bw.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, TZ))), x, y, TZ, 4.0, 300), 6.0, 400, 450)
+                      doc['g'] = budget_tris(layer_shape(bg.get((x, y)), x, y, TZ, 6.0, 3000, merge=8.0), 8.0, 4000, 550)
+                      doc['b'] = budget_tris(layer_shape(bs.get((x, y)), x, y, TZ, 6.0, 3000), 8.0, 4000, 120)
+                      doc['l'] = chunked_lines(bl.get((x, y), []), x, y, TZ, 5.0, {1, 2, 8})
                   except Exception as e:
                       log('  map for tile', x, y, 'failed:', e)
                       doc['w'], doc['g'], doc['b'], doc['l'] = [], [], [], []
@@ -1329,7 +1501,7 @@ jobs:
               # overview tiles
               big_w = [g for g in water if (lambda b: (b[2] - b[0]) * (b[3] - b[1]))(g.bounds) > 2e-5] + sea
               big_g = [g for g in R.areas['g'] if (lambda b: (b[2] - b[0]) * (b[3] - b[1]))(g.bounds) > 2e-4]
-              big_l = [it for it in R.lines if it[0] in (1, 6)]
+              big_l = [it for it in R.lines if it[0] == 1]
               ow, og, ol = bucket(big_w, OZ), bucket(big_g, OZ), bucket(big_l, OZ, with_cls=True)
               otiles = []
               ox0, oy1 = tile_of(lon_min, lat_min, OZ)
@@ -1337,10 +1509,10 @@ jobs:
               oall = {(x, y) for x in range(ox0, ox1 + 1) for y in range(oy0, oy1 + 1)}
               for (x, y) in sorted(oall | set(tile_of(s['lon'], s['lat'], OZ) for s in stops.values())):
                   try:
-                      doc = {'v': 1, 'x': x, 'y': y, 'z': OZ,
-                             'w': layer_tris(ow.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, OZ))), x, y, OZ, 2.0, 40),
-                             'g': layer_tris(og.get((x, y)), x, y, OZ, 3.0, 400),
-                             'l': layer_lines(ol.get((x, y), []), x, y, OZ, 2.0, {1, 6})}
+                      doc = {'v': 2, 'x': x, 'y': y, 'z': OZ,
+                             'w': budget_tris(layer_shape(ow.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, OZ))), x, y, OZ, 2.0, 40), 2.5, 60, 700),
+                             'g': budget_tris(layer_shape(og.get((x, y)), x, y, OZ, 3.0, 400, merge=3.0), 4.0, 600, 500),
+                             'l': chunked_lines(ol.get((x, y), []), x, y, OZ, 3.0, {1})}
                   except Exception as e:
                       log('  overview tile', x, y, 'failed:', e)
                       continue
@@ -1351,7 +1523,7 @@ jobs:
 
               bb = [e5(lat_min + 0.1), e5(lon_min + 0.1), e5(lat_max - 0.1), e5(lon_max - 0.1)]
               write_json(os.path.join(out, 'meta.json'), {
-                  'v': 1, 'region': a.region, 'name': a.name or a.region, 'built': time.strftime('%Y-%m-%d'), 'bbox': bb,
+                  'v': 2, 'region': a.region, 'name': a.name or a.region, 'built': time.strftime('%Y-%m-%d'), 'bbox': bb,
                   'tz': TZ, 'oz': OZ, 'ext': EXT, 't': tiles, 'o': otiles,
                   'counts': {'routes': len(routes), 'stops': len(stops), 'places': len(places), 'towns': len(tdoc),
                              'modes': dict(Counter(r['mode'] for r in routes))}})
@@ -1361,7 +1533,7 @@ jobs:
           if __name__ == '__main__':
               main()
           PYEOF
-          python3 world_build.py --pbf region.osm.pbf --region "$REGION" --name "$REGION_NAME" --out out
+          python3 world_build.py --pbf region.osm.pbf --poly region.poly --region "$REGION" --name "$REGION_NAME" --out out
       - name: Save them
         env:
           TOKEN: ${{ github.token }}
