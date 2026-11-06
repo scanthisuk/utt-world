@@ -2041,9 +2041,9 @@ jobs:
                          'g': r['g'], 'km': r['km']}
                   write_json(os.path.join(out, 'r', f"{r['rid'] % 100:02d}", r['id'] + '.json'), doc)
               # (the other direction of a route, and any route merged into another: which one it is now,
-              # so a game that has it carries on with that)
-              for old, new in aliases.items():
-                  write_json(os.path.join(out, 'r', f"{int(old[1:]) % 100:02d}", old + '.json'), {'v': 2, 'id': old, 'alias': new})
+              # so a game that has it carries on with that. One file for them all: a Pages site with too
+              # many files takes too long to go live)
+              write_json(os.path.join(out, 'aliases.json'), {'v': 1, 'a': aliases})
               log('wrote routes', len(routes), 'and', len(aliases), 'other directions pointing at them')
 
               # places
@@ -2218,7 +2218,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: ${{ steps.deploy.outputs.page_url || steps.deploy2.outputs.page_url }}
     steps:
       - name: Collect every region
         env:
@@ -2241,6 +2241,26 @@ jobs:
           repo = os.environ['REPO']
           regions, towns = [], []
           sizes = {}
+          # (data built by an older builder has a file for each route that's now another one's
+          # other direction: they go in one file, as a Pages site with too many files takes too
+          # long to go live)
+          for reg_dir in sorted(glob.glob('site/*/')):
+              al = {}
+              for p in glob.glob(reg_dir + 'r/*/*.json'):
+                  if os.path.getsize(p) < 300:
+                      try:
+                          d = json.load(open(p))
+                      except Exception:
+                          continue
+                      if isinstance(d, dict) and isinstance(d.get('alias'), str):
+                          al[d.get('id') or os.path.basename(p)[:-5]] = d['alias']
+                          os.remove(p)
+              if al:
+                  ap = reg_dir + 'aliases.json'
+                  if os.path.exists(ap):
+                      al.update(json.load(open(ap)).get('a', {}))
+                  json.dump({'v': 1, 'a': al}, open(ap, 'w'), separators=(',', ':'))
+                  print(reg_dir, len(al), 'routes that are now others put in one file')
           for meta in sorted(glob.glob('site/*/meta.json')):
               r = os.path.basename(os.path.dirname(meta))
               m = json.load(open(meta))
@@ -2279,4 +2299,9 @@ jobs:
         with:
           path: site
       - id: deploy
+        uses: actions/deploy-pages@v4
+        continue-on-error: true
+      # (Pages is sometimes slow to take a big site: once more if it timed out)
+      - id: deploy2
+        if: steps.deploy.outcome == 'failure'
         uses: actions/deploy-pages@v4
