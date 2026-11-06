@@ -117,6 +117,7 @@ jobs:
           import os
           import re
           import time
+          from array import array
           from collections import Counter, defaultdict
 
           import numpy as np
@@ -290,6 +291,11 @@ jobs:
               ('landuse', 'cemetery'), ('landuse', 'village_green'), ('natural', 'wood'),
               ('natural', 'heath'), ('natural', 'beach'), ('natural', 'sand'),
               ('highway', 'motorway'), ('highway', 'trunk'), ('highway', 'primary'), ('highway', 'secondary'),
+              # (the smaller roads too: to join the gaps in bus routes along them)
+              ('highway', 'tertiary'), ('highway', 'unclassified'), ('highway', 'residential'), ('highway', 'road'),
+              ('highway', 'living_street'), ('highway', 'service'), ('highway', 'busway'), ('highway', 'bus_guideway'),
+              ('highway', 'motorway_link'), ('highway', 'trunk_link'), ('highway', 'primary_link'), ('highway', 'secondary_link'),
+              ('highway', 'tertiary_link'),
               ('railway', 'rail'), ('railway', 'light_rail'), ('railway', 'subway'), ('railway', 'tram'),
               ('aeroway', 'aerodrome'), ('natural', 'coastline'),
           ] + [('tourism', v) for v in ('attraction', 'museum', 'zoo', 'theme_park', 'gallery', 'aquarium')] + \
@@ -607,6 +613,11 @@ jobs:
 
 
           def chain_of(R, rel):
+              """the route's ways joined end to end into one line (lon, lat), and the jumps in it:
+              [k, ...] where chain[k - 1] -> chain[k] is a jump over a gap (no road between them).
+              Relations often list their ways out of order, so each next way is the one that joins on
+              where the line has got to (the next listed one if several do); only when none does is
+              there a gap."""
               ways = []
               for typ, ref, role in rel['members']:
                   if typ == 'w' and role in GEOM_ROLES:
@@ -614,43 +625,190 @@ jobs:
                       if c is not None and len(c) >= 2:
                           ways.append([(float(x), float(y)) for x, y in c])
               if not ways:
-                  return []
+                  return [], []
 
               def d2(a, b):
                   return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
-              chain, ring_start = [], None
-              for idx, pts in enumerate(ways):
-                  closed = len(pts) > 3 and d2(pts[0], pts[-1]) < 1e-14
-                  if not chain:
-                      if not closed and idx + 1 < len(ways):
-                          nxt = ways[idx + 1]
-                          if min(d2(pts[0], nxt[0]), d2(pts[0], nxt[-1])) < min(d2(pts[-1], nxt[0]), d2(pts[-1], nxt[-1])):
-                              pts = pts[::-1]
-                      chain = list(pts)
-                      ring_start = 0 if closed else None
+              TOUCH = 2e-9          # (same node: within about 5 cm)
+              NEAR = 0.00035 ** 2   # (a little break in the map data: within about 25-40 m)
+              closed = [len(w) > 3 and d2(w[0], w[-1]) < 1e-14 for w in ways]
+              n = len(ways)
+              # every way end (and every node of a roundabout), on a grid, to find what joins where
+              cell = 0.002
+              grid = defaultdict(list)
+              for i, w in enumerate(ways):
+                  pts = w[:-1] if closed[i] else (w[0], w[-1])
+                  for p in pts:
+                      grid[(int(p[0] / cell), int(p[1] / cell))].append((i, p))
+
+              def joining(at, used, lim):
+                  """unused ways with an end (or, for a roundabout, any node) within lim of a point"""
+                  gx, gy = int(at[0] / cell), int(at[1] / cell)
+                  out = {}
+                  for dx in (-1, 0, 1):
+                      for dy in (-1, 0, 1):
+                          for i, p in grid.get((gx + dx, gy + dy), ()):
+                              if not used[i]:
+                                  d = d2(at, p)
+                                  if d <= lim and (i not in out or d < out[i]):
+                                      out[i] = d
+                  return out
+              def kk(p):
+                  return (round(p[0], 7), round(p[1], 7))
+              touch = Counter()
+              for i, w in enumerate(ways):
+                  for p in (w if closed[i] else w[1:-1]):
+                      touch[kk(p)] += 2
+                  if not closed[i]:
+                      touch[kk(w[0])] += 1
+                      touch[kk(w[-1])] += 1
+              # every end of the route: a way end no other way touches
+              ends = []
+              for i, w in enumerate(ways):
+                  if closed[i]:
                       continue
-                  if ring_start is not None:
-                      best = None
-                      for k in range(ring_start, len(chain)):
-                          for end, rev in ((pts[0], False), (pts[-1], True)):
-                              dd = d2(chain[k], end)
-                              if best is None or dd < best[0]:
-                                  best = (dd, k, rev)
-                      _, k, rev = best
-                      del chain[k + 1:]
-                      if rev:
-                          pts = pts[::-1]
-                      ring_start = None
-                  elif d2(chain[-1], pts[-1]) < d2(chain[-1], pts[0]):
-                      pts = pts[::-1]
-                  if closed:
-                      k = min(range(len(pts) - 1), key=lambda i: d2(pts[i], chain[-1]))
-                      ring = pts[k:-1] + pts[:k + 1]
-                      ring_start = len(chain)
-                      chain += ring
+                  if touch[kk(w[0])] == 1:
+                      ends.append((i, False))
+                  if touch[kk(w[-1])] == 1:
+                      ends.append((i, True))
+
+              def walk(start, flip):
+                  used = [False] * n
+                  chain, jumps = [], []
+                  ring_from = None      # (the line ends going round a roundabout: from this index on)
+                  cur = start
+                  w = ways[start][::-1] if flip else ways[start]
+                  used[start] = True
+                  if start != 0 or flip:
+                      chain = list(w)
+                  elif not closed[0]:
+                      a_n = joining(w[0], used, NEAR)
+                      b_n = joining(w[-1], used, NEAR)
+                      if a_n and not b_n:
+                          w = w[::-1]
+                      elif a_n and b_n and min(a_n) < min(b_n):
+                          w = w[::-1]
+                      chain = list(w)
                   else:
-                      chain += pts[1:] if d2(chain[-1], pts[0]) < 1e-14 else pts
-              return chain
+                      chain = list(w)
+                      ring_from = 0
+                  while not all(used):
+                      # where the line is now: its end, or anywhere round the roundabout it's on
+                      heads = chain[ring_from:] if ring_from is not None else [chain[-1]]
+                      best = None
+                      for lim in (TOUCH, NEAR):
+                          for k, e in enumerate(heads):
+                              for i, d in joining(e, used, lim).items():
+                                  # (the next listed way first, then the nearest)
+                                  key = (0 if i > cur else 1, i if i > cur else -i, d)
+                                  if best is None or key < best[0]:
+                                      best = (key, i, k)
+                          if best:
+                              break
+                      if best:
+                          _, i, k = best
+                          if ring_from is not None:
+                              # leave the roundabout where this way joins it
+                              del chain[ring_from + k + 1:]
+                              ring_from = None
+                          joint = chain[-1]
+                      else:
+                          # a gap: carry on with the way that starts nearest to here (the gap's probably a
+                          # little bit of road missing from the map; ways nowhere near go on the end)
+                          joint = chain[-1]
+                          near_i, near_d = None, None
+                          for j in range(n):
+                              if not used[j]:
+                                  pts = ways[j][:-1] if closed[j] else (ways[j][0], ways[j][-1])
+                                  dj = min(d2(p, joint) for p in pts)
+                                  if near_d is None or dj < near_d - 1e-12 or (abs(dj - near_d) <= 1e-12 and j > cur and near_i < cur):
+                                      near_i, near_d = j, dj
+                          i = near_i
+                          ring_from = None
+                      w = ways[i]
+                      used[i] = True
+                      cur = i
+                      if closed[i]:
+                          k = min(range(len(w) - 1), key=lambda j: d2(w[j], joint))
+                          ring = w[k:-1] + w[:k + 1]
+                          if d2(ring[0], joint) > NEAR:
+                              jumps.append(len(chain))
+                          ring_from = len(chain)
+                          chain += ring
+                      else:
+                          if d2(w[-1], joint) < d2(w[0], joint):
+                              w = w[::-1]
+                          if d2(w[0], joint) > NEAR:
+                              jumps.append(len(chain))
+                              chain += w
+                          else:
+                              chain += w[1:] if d2(w[0], joint) < 1e-14 else w
+                  return chain, jumps
+
+              def gap_km(cj):
+                  c, j = cj
+                  return sum(hav_km(c[k - 1], c[k]) for k in j)
+              # (start at an end of the route: the first listed way if it's one, else the earliest listed
+              # way that is. A list in a muddle can put a route's end in the middle of the list: if that
+              # leaves gaps, each other end is tried, and the one with the least gap kept)
+              start, flip = ends[0] if ends else (0, False)
+              best = walk(start, flip)
+              gap = gap_km(best)
+              if gap > 0.3:
+                  for i, f in ends[1:16]:
+                      cj = walk(i, f)
+                      g = gap_km(cj)
+                      if g < gap - 0.05:
+                          best, gap = cj, g
+              return best
+
+
+          def passes(xy, cum, pxy, tol):
+              """each time the line (xy, n x 2 km) comes within tol km of a point: [(s along it, distance)]"""
+              a = xy[:-1]
+              d = xy[1:] - a
+              L = np.hypot(d[:, 0], d[:, 1])
+              L2 = np.maximum(L * L, 1e-18)
+              t = np.clip(((pxy[0] - a[:, 0]) * d[:, 0] + (pxy[1] - a[:, 1]) * d[:, 1]) / L2, 0.0, 1.0)
+              dist = np.hypot(pxy[0] - (a[:, 0] + t * d[:, 0]), pxy[1] - (a[:, 1] + t * d[:, 1]))
+              idx = np.nonzero(dist <= tol)[0]
+              if not len(idx):
+                  return []
+              out = []
+              for run in np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1):
+                  j = int(run[np.argmin(dist[run])])
+                  sv = float(cum[j] + t[j] * L[j])
+                  # (two bits of one pass, a little apart: the closer one)
+                  if out and sv - out[-1][0] < 0.08:
+                      if dist[j] < out[-1][1]:
+                          out[-1] = (sv, float(dist[j]))
+                      continue
+                  out.append((sv, float(dist[j])))
+              return out
+
+
+          def in_order(cands):
+              """the most stops, in their listed order, that also go forward along the line: each stop has
+              some places it's passed [(s, d)]; returns [(index in the list, s)]"""
+              import bisect
+              tails, tail_at, back = [], [], {}
+              for k, cs in enumerate(cands):
+                  for s, _ in sorted(cs, reverse=True):
+                      pos = bisect.bisect_left(tails, s)
+                      node = (k, s)
+                      back[node] = tail_at[pos - 1] if pos else None
+                      if pos == len(tails):
+                          tails.append(s)
+                          tail_at.append(node)
+                      else:
+                          tails[pos] = s
+                          tail_at[pos] = node
+              out = []
+              node = tail_at[-1] if tail_at else None
+              while node is not None:
+                  out.append(node)
+                  node = back[node]
+              return out[::-1]
 
 
           def project_along(xy, pxy, start_s):
@@ -692,16 +850,464 @@ jobs:
               return None, None
 
 
-          def build_routes(R, stops, stop_of):
+          def road_graph(R, rel, kx, ky):
+              """the relation's ways as a network of points (km), joined wherever ways share a node"""
+              vid, pts, adj = {}, [], defaultdict(list)
+              a_list, b_list = [], []
+              for typ, ref, role in rel['members']:
+                  if typ != 'w' or role not in GEOM_ROLES:
+                      continue
+                  c = R.way_geom.get(ref)
+                  if c is None or len(c) < 2:
+                      continue
+                  prev = None
+                  for lon, lat in c:
+                      k = (round(float(lon), 7), round(float(lat), 7))
+                      v = vid.get(k)
+                      if v is None:
+                          v = len(pts)
+                          vid[k] = v
+                          pts.append((float(lon) * kx, float(lat) * ky))
+                      if prev is not None and prev != v:
+                          w = math.hypot(pts[v][0] - pts[prev][0], pts[v][1] - pts[prev][1])
+                          adj[prev].append((v, w))
+                          adj[v].append((prev, w))
+                          a_list.append(prev)
+                          b_list.append(v)
+                      prev = v
+              if not a_list:
+                  return None
+              P = np.array(pts)
+              return {'p': P, 'adj': adj, 'a': np.array(a_list), 'b': np.array(b_list)}
+
+
+          def snap(G, q):
+              """the nearest point of the network to q: (edge, t along it, distance)"""
+              A, B = G['p'][G['a']], G['p'][G['b']]
+              d = B - A
+              L2 = np.maximum((d * d).sum(1), 1e-18)
+              t = np.clip(((q[0] - A[:, 0]) * d[:, 0] + (q[1] - A[:, 1]) * d[:, 1]) / L2, 0.0, 1.0)
+              dist = np.hypot(q[0] - (A[:, 0] + t * d[:, 0]), q[1] - (A[:, 1] + t * d[:, 1]))
+              e = int(np.argmin(dist))
+              return e, float(t[e]), float(dist[e])
+
+
+          def route_between(G, sa, sb):
+              """the shortest way along the network from one snapped point to another: [(x, y)] km, or None"""
+              import heapq
+              P, adj = G['p'], G['adj']
+              ea, ta, _ = sa
+              eb, tb, _ = sb
+              a1, a2 = int(G['a'][ea]), int(G['b'][ea])
+              b1, b2 = int(G['a'][eb]), int(G['b'][eb])
+              qa = P[a1] + (P[a2] - P[a1]) * ta
+              qb = P[b1] + (P[b2] - P[b1]) * tb
+              La = math.hypot(*(P[a2] - P[a1]))
+              Lb = math.hypot(*(P[b2] - P[b1]))
+              if ea == eb:
+                  return [tuple(qa), tuple(qb)], math.hypot(*(qb - qa))
+              dist, back = {a1: ta * La, a2: (1 - ta) * La}, {a1: None, a2: None}
+              goal = {b1: tb * Lb, b2: (1 - tb) * Lb}
+              heap = [(dist[a1], a1), (dist[a2], a2)]
+              heapq.heapify(heap)
+              best, best_v = None, None
+              done = set()
+              while heap:
+                  c, v = heapq.heappop(heap)
+                  if v in done:
+                      continue
+                  if best is not None and c >= best:
+                      break
+                  done.add(v)
+                  if v in goal and (best is None or c + goal[v] < best):
+                      best, best_v = c + goal[v], v
+                  for u, w in adj[v]:
+                      nc = c + w
+                      if nc < dist.get(u, 1e18):
+                          dist[u] = nc
+                          back[u] = v
+                          heapq.heappush(heap, (nc, u))
+              if best_v is None:
+                  return None, None
+              path = []
+              v = best_v
+              while v is not None:
+                  path.append(tuple(P[v]))
+                  v = back[v]
+              return [tuple(qa)] + path[::-1] + [tuple(qb)], best
+
+
+          def chain_by_stops(R, rel, seq, stops, kx, ky, near):
+              """when a relation's ways are muddled: its line, made by going from each listed stop to the
+              next along its own ways. Returns (chain lon/lat, jumps) or None if the stops are muddled too."""
+              G = road_graph(R, rel, kx, ky)
+              if G is None:
+                  return None
+              total_net = float(np.hypot(*(G['p'][G['b']] - G['p'][G['a']]).T).sum())
+              snaps = []
+              for sid in seq:
+                  st = stops[sid]
+                  sn = snap(G, (st['lon'] * kx, st['lat'] * ky))
+                  if sn[2] <= max(near, 0.06):
+                      snaps.append(sn)
+              if len(snaps) < 2:
+                  return None
+              pts, jumps, run = [], [], 0.0
+              for i in range(1, len(snaps)):
+                  path, L = route_between(G, snaps[i - 1], snaps[i])
+                  straight = math.hypot(*(np.subtract(path[-1], path[0]))) if path else 0.0
+                  # (no way there, or only a long way round: a gap)
+                  if path is None or (L > 3 * straight + 1.5):
+                      P0 = G['p']
+                      e, t, _ = snaps[i]
+                      q = P0[G['a'][e]] + (P0[G['b'][e]] - P0[G['a'][e]]) * t
+                      if not pts:
+                          e0, t0, _ = snaps[i - 1]
+                          pts.append(tuple(P0[G['a'][e0]] + (P0[G['b'][e0]] - P0[G['a'][e0]]) * t0))
+                      jumps.append(len(pts))
+                      pts.append(tuple(q))
+                      continue
+                  run += L
+                  pts += path[1:] if pts else path
+              # (going back and forth all over its own roads: the stops are in no useful order)
+              if run > 3 * total_net + 2:
+                  return None
+              return [(x / kx, y / ky) for x, y in pts], jumps
+
+
+          # ---------------------------------------------------------------- roads: to join the gaps in a bus route's line
+          # (a route's list of roads in the map data often misses a bit out: rather than a straight line
+          # across fields and houses there, the bus goes the way the real roads go)
+          BUS_ROADS = {'motorway': 1.0, 'motorway_link': 1.0, 'trunk': 1.0, 'trunk_link': 1.0, 'primary': 1.0,
+                       'primary_link': 1.0, 'secondary': 1.0, 'secondary_link': 1.0, 'tertiary': 1.05, 'tertiary_link': 1.05,
+                       'unclassified': 1.15, 'residential': 1.25, 'road': 1.3, 'living_street': 1.6, 'service': 1.8,
+                       'busway': 0.9, 'bus_guideway': 0.9}
+          NOT_FOR_BUSES = {'parking_aisle', 'driveway', 'drive-through', 'emergency_access', 'alley'}
+          FILL_MAX = 6.0      # (km: a gap longer than this isn't a bit of road missing from a list)
+
+
+          class Roads:
+              """first time round, the gaps every bus route needs joining; then the roads round them
+              (read from the map, packed tight: there can be millions of bits of road), and the way along
+              them from one side of each gap to the other"""
+              CELL = 0.002
+
+              def __init__(self):
+                  self.boxes = []
+                  self.asked = set()
+                  self.loaded = False
+                  self.cache = {}
+                  self.xs, self.ys = array('d'), array('d')      # each point: lon, lat
+                  self.eu, self.ev = array('i'), array('i')      # each bit of road: from, to
+                  self.off = self.nbr = self.ncost = None        # each point's bits of road, either way
+                  self.grid = {}                                 # cell -> the bits of road in it
+
+              def ask(self, a, b):
+                  """the road from a to b (lon, lat) as [(lon, lat)], or None"""
+                  d = hav_km(a, b)
+                  if d < 0.05 or d > FILL_MAX:
+                      return None
+                  key = (round(a[0], 6), round(a[1], 6), round(b[0], 6), round(b[1], 6))
+                  if not self.loaded:
+                      if key not in self.asked:
+                          self.asked.add(key)
+                          m = 0.4 + 0.3 * d
+                          dy = m / 110.574
+                          dx = m / (111.320 * math.cos(math.radians((a[1] + b[1]) / 2)))
+                          self.boxes.append((min(a[0], b[0]) - dx, min(a[1], b[1]) - dy, max(a[0], b[0]) + dx, max(a[1], b[1]) + dy))
+                      return None
+                  if key not in self.cache:
+                      self.cache[key] = self.route(a, b, d)
+                  return self.cache[key]
+
+              def load(self, path):
+                  """the roads buses can use that go near any of the gaps"""
+                  self.loaded = True
+                  if not self.boxes:
+                      return
+                  cell = 0.02
+                  bgrid = defaultdict(list)
+                  for i, (x0, y0, x1, y1) in enumerate(self.boxes):
+                      for gx in range(math.floor(x0 / cell), math.floor(x1 / cell) + 1):
+                          for gy in range(math.floor(y0 / cell), math.floor(y1 / cell) + 1):
+                              bgrid[(gx, gy)].append(i)
+                  boxes, C = self.boxes, self.CELL
+                  xs, ys, eu, ev, grid = self.xs, self.ys, self.eu, self.ev, self.grid
+                  cf, cb = array('f'), array('f')
+                  idx = {}
+                  nways = 0
+                  fp = osmium.FileProcessor(path, osmium.osm.NODE | osmium.osm.WAY).with_locations().with_filter(osmium.filter.KeyFilter('highway'))
+                  for o in fp:
+                      if not o.is_way():
+                          continue
+                      t = o.tags
+                      hw = t.get('highway')
+                      f = BUS_ROADS.get(hw)
+                      if f is None or t.get('area') == 'yes' or t.get('service') in NOT_FOR_BUSES:
+                          continue
+                      if t.get('access') in ('no', 'private') and t.get('bus') not in ('yes', 'designated') and \
+                              t.get('psv') not in ('yes', 'designated'):
+                          continue
+                      try:
+                          nds = [(n.ref, n.location.lon, n.location.lat) for n in o.nodes]
+                      except osmium.InvalidLocationError:
+                          continue
+                      if len(nds) < 2:
+                          continue
+                      lons = [n[1] for n in nds]
+                      lats = [n[2] for n in nds]
+                      x0, x1, y0, y1 = min(lons), max(lons), min(lats), max(lats)
+                      hit = False
+                      for gx in range(math.floor(x0 / cell), math.floor(x1 / cell) + 1):
+                          for gy in range(math.floor(y0 / cell), math.floor(y1 / cell) + 1):
+                              for i in bgrid.get((gx, gy), ()):
+                                  b = boxes[i]
+                                  if x0 <= b[2] and x1 >= b[0] and y0 <= b[3] and y1 >= b[1]:
+                                      hit = True
+                                      break
+                              if hit:
+                                  break
+                          if hit:
+                              break
+                      if not hit:
+                          continue
+                      nways += 1
+                      ow = t.get('oneway', '')
+                      if t.get('junction') in ('roundabout', 'circular') or hw in ('motorway', 'motorway_link'):
+                          ow = ow or 'yes'
+                      if t.get('oneway:bus') == 'no' or t.get('oneway:psv') == 'no':
+                          ow = 'no'
+                      # (the wrong way down a one way street only if there's no other way)
+                      pf = 4.0 if ow == '-1' else 1.0
+                      pb = 4.0 if ow in ('yes', 'true', '1') else 1.0
+                      kx = 111.320 * math.cos(math.radians(nds[0][2]))
+                      prev = None
+                      for ref, lon, lat in nds:
+                          i = idx.get(ref)
+                          if i is None:
+                              i = len(xs)
+                              idx[ref] = i
+                              xs.append(lon)
+                              ys.append(lat)
+                          if prev is not None and prev[0] != i:
+                              L = math.hypot((lon - prev[1]) * kx, (lat - prev[2]) * 110.574)
+                              e = len(eu)
+                              eu.append(prev[0])
+                              ev.append(i)
+                              cf.append(L * f * pf)
+                              cb.append(L * f * pb)
+                              for gx in range(math.floor(min(lon, prev[1]) / C), math.floor(max(lon, prev[1]) / C) + 1):
+                                  for gy in range(math.floor(min(lat, prev[2]) / C), math.floor(max(lat, prev[2]) / C) + 1):
+                                      g = grid.get((gx, gy))
+                                      if g is None:
+                                          g = grid[(gx, gy)] = array('i')
+                                      g.append(e)
+                          prev = (i, lon, lat)
+                  del idx
+                  # (each point's bits of road, both ways along them, one after another)
+                  n, m = len(xs), len(eu)
+                  off = array('i', [0]) * (n + 1)
+                  for k in range(m):
+                      off[eu[k] + 1] += 1
+                      off[ev[k] + 1] += 1
+                  for i in range(n):
+                      off[i + 1] += off[i]
+                  at = array('i', off)
+                  nbr = array('i', [0]) * (2 * m)
+                  ncost = array('f', [0.0]) * (2 * m)
+                  for k in range(m):
+                      u, v = eu[k], ev[k]
+                      j = at[u]
+                      nbr[j], ncost[j] = v, cf[k]
+                      at[u] = j + 1
+                      j = at[v]
+                      nbr[j], ncost[j] = u, cb[k]
+                      at[v] = j + 1
+                  self.off, self.nbr, self.ncost = off, nbr, ncost
+                  log('roads round', len(self.boxes), 'gaps in bus routes:', nways, 'ways,', n, 'points')
+
+              def snap(self, p, lim=0.15):
+                  """the nearest bit of road to p: (km away, point, point, how far along)"""
+                  C = self.CELL
+                  gx, gy = math.floor(p[0] / C), math.floor(p[1] / C)
+                  kx, ky = 111.320 * math.cos(math.radians(p[1])), 110.574
+                  xs, ys, eu, ev = self.xs, self.ys, self.eu, self.ev
+                  best = None
+                  for dx in (-1, 0, 1):
+                      for dy in (-1, 0, 1):
+                          for e in self.grid.get((gx + dx, gy + dy), ()):
+                              u, v = eu[e], ev[e]
+                              ax, ay = (xs[u] - p[0]) * kx, (ys[u] - p[1]) * ky
+                              ex, ey = (xs[v] - xs[u]) * kx, (ys[v] - ys[u]) * ky
+                              L2 = ex * ex + ey * ey
+                              t = 0.0 if L2 < 1e-12 else max(0.0, min(1.0, -(ax * ex + ay * ey) / L2))
+                              d = math.hypot(ax + t * ex, ay + t * ey)
+                              if best is None or d < best[0]:
+                                  best = (d, u, v, t)
+                  return best if best is not None and best[0] <= lim else None
+
+              def cost(self, u, v):
+                  best = 1e9
+                  for k in range(self.off[u], self.off[u + 1]):
+                      if self.nbr[k] == v and self.ncost[k] < best:
+                          best = self.ncost[k]
+                  return best
+
+              def route(self, a, b, d):
+                  import heapq
+                  sa, sb = self.snap(a), self.snap(b)
+                  if not sa or not sb:
+                      return None
+                  _, ua, va, ta = sa
+                  _, ub, vb, tb = sb
+                  xs, ys, off, nbr, ncost = self.xs, self.ys, self.off, self.nbr, self.ncost
+
+                  def at(u, v, t):
+                      return (xs[u] + (xs[v] - xs[u]) * t, ys[u] + (ys[v] - ys[u]) * t)
+                  qa, qb = at(ua, va, ta), at(ub, vb, tb)
+                  if {ua, va} == {ub, vb}:
+                      return [qa, qb]
+                  kx, ky = 111.320 * math.cos(math.radians((a[1] + b[1]) / 2)), 110.574
+                  tx, ty = qb[0] * kx, qb[1] * ky
+
+                  def h(n):
+                      return 0.9 * math.hypot(tx - xs[n] * kx, ty - ys[n] * ky)
+                  dist, back, heap = {}, {}, []
+                  for n, c in ((va, (1 - ta) * self.cost(ua, va)), (ua, ta * self.cost(va, ua))):
+                      if c < dist.get(n, 1e18):
+                          dist[n], back[n] = c, None
+                          heapq.heappush(heap, (c + h(n), c, n))
+                  goal = {ub: tb * self.cost(ub, vb), vb: (1 - tb) * self.cost(vb, ub)}
+                  limit = 2.5 * d + 2.0
+                  best, best_n, done = None, None, set()
+                  while heap:
+                      fc, c, n = heapq.heappop(heap)
+                      if n in done:
+                          continue
+                      if fc > limit or (best is not None and fc >= best):
+                          break
+                      done.add(n)
+                      if n in goal and (best is None or c + goal[n] < best):
+                          best, best_n = c + goal[n], n
+                      for k in range(off[n], off[n + 1]):
+                          w = nbr[k]
+                          nc = c + ncost[k]
+                          if nc < dist.get(w, 1e18):
+                              dist[w], back[w] = nc, n
+                              heapq.heappush(heap, (nc + h(w), nc, w))
+                  if best_n is None:
+                      return None
+                  path, n = [], best_n
+                  while n is not None:
+                      path.append((xs[n], ys[n]))
+                      n = back[n]
+                  pts = [qa] + path[::-1] + [qb]
+                  if sum(hav_km(pts[i - 1], pts[i]) for i in range(1, len(pts))) > 1.8 * d + 1.0:
+                      return None
+                  return pts
+
+
+          def order_pieces(chain, jumps):
+              """the bits of a line between its gaps, put in the order (each either way round) that makes
+              the gaps shortest: a line the list put together from the middle then goes end to end, instead
+              of out to one end and back over itself"""
+              if not jumps:
+                  return chain, jumps
+              cuts = [0] + list(jumps) + [len(chain)]
+              pieces = [chain[cuts[i]:cuts[i + 1]] for i in range(len(cuts) - 1)]
+              pieces = [q for q in pieces if q]
+              n = len(pieces)
+              if n < 2 or n > 40:
+                  return chain, jumps
+              before = sum(hav_km(chain[k - 1], chain[k]) for k in jumps)
+              best = None
+              for first in range(n):
+                  for rev in (False, True):
+                      used = [False] * n
+                      used[first] = True
+                      cur = pieces[first][::-1] if rev else pieces[first]
+                      order, total, end = [cur], 0.0, cur[-1]
+                      for _ in range(n - 1):
+                          bj, br, bd = None, None, None
+                          for j in range(n):
+                              if used[j]:
+                                  continue
+                              for r in (False, True):
+                                  d = hav_km(end, pieces[j][-1] if r else pieces[j][0])
+                                  if bd is None or d < bd:
+                                      bj, br, bd = j, r, d
+                          used[bj] = True
+                          q = pieces[bj][::-1] if br else pieces[bj]
+                          order.append(q)
+                          total += bd
+                          end = q[-1]
+                      if best is None or total < best[0] - 1e-9:
+                          best = (total, order)
+              total, order = best
+              if total > 0.5 * before or before - total < 0.5:
+                  return chain, jumps
+              out, left = [], []
+              for q in order:
+                  if out:
+                      left.append(len(out))
+                  out += q
+              return out, left
+
+
+          def join_gaps(chain, jumps, roads):
+              """a line's gaps joined along the roads where they can be: (line, the gaps left, how many joined)"""
+              if not jumps or roads is None:
+                  return chain, jumps, 0
+              out, left, last, n = [], [], 0, 0
+              for k in jumps:
+                  out += chain[last:k]
+                  path = roads.ask(chain[k - 1], chain[k]) if hav_km(chain[k - 1], chain[k]) > 0.1 else None
+                  if path:
+                      out += path
+                      n += 1
+                  else:
+                      left.append(len(out))
+                  last = k
+              out += chain[last:]
+              return out, left, n
+
+
+          def line_from_stops(seq, stops, roads):
+              """a bus route with no roads listed at all: along the roads from each stop to the next
+              (only if they're listed in an order that makes sense: each one near the last)"""
+              pts = [(stops[s]['lon'], stops[s]['lat']) for s in seq]
+              gaps = sorted(hav_km(pts[i - 1], pts[i]) for i in range(1, len(pts)))
+              if roads is None or not gaps or gaps[-1] > FILL_MAX or gaps[len(gaps) // 2] > 1.5:
+                  return [], []
+              chain, jumps = [pts[0]], []
+              for i in range(1, len(pts)):
+                  path = roads.ask(pts[i - 1], pts[i])
+                  if path:
+                      chain += path
+                  else:
+                      jumps.append(len(chain))
+                  chain.append(pts[i])
+              return chain, jumps
+
+
+          # how far a stop can be from its route's line, and the longest gap in the line that's joined
+          # with a straight bit (km). Buses never go in a straight line where there's no road in the data:
+          # a route with a bigger gap than that keeps its longest part that has the road all the way.
+          STOP_NEAR = {'bus': 0.06, 'tram': 0.08, 'metro': 0.25, 'train': 0.35, 'ferry': 0.6}
+          GAP_OK = {'bus': 0.5, 'tram': 0.5, 'metro': 1.0, 'train': 1.5, 'ferry': 1e9}
+
+
+          def build_routes(R, stops, stop_of, roads=None):
               out = []
               loose = None
+              fixed = Counter()
               for rid, rel in R.routes.items():
                   t = rel['tags']
                   mode = ROUTE_MODES[t['route']]
                   nm = (t.get('name', '') + ' ' + t.get('description', '')).lower()
                   if any(w in nm for w in SKIP_WORDS) or t.get('disused') == 'yes' or t.get('state') in ('proposed', 'disused'):
                       continue
-                  # stops in order: the stop positions, or else the platforms
+                  # stops: the stop positions, or else the platforms (in the order listed: often wrong)
                   seq_s, seq_p = [], []
                   for typ, ref, role in rel['members']:
                       if typ not in ('n', 'w'):
@@ -720,59 +1326,134 @@ jobs:
                       if not dedup or dedup[-1] != s:
                           dedup.append(s)
                   seq = dedup
-                  chain = chain_of(R, rel)
-                  if len(chain) >= 2 and t['route'] in ('bus', 'trolleybus', 'minibus', 'tram'):
+                  chain, jumps = chain_of(R, rel)
+                  if mode != 'ferry' and jumps:
+                      ordered = order_pieces(chain, jumps)
+                      if ordered[0] is not chain:
+                          chain, jumps = ordered
+                          fixed['line put end to end'] += 1
+                  near = STOP_NEAR[mode]
+                  if len(chain) < 2 and mode == 'bus' and len(seq) >= 2:
+                      chain, jumps = line_from_stops(seq, stops, roads)
+                      if len(chain) >= 2:
+                          fixed['line made along the roads from stop to stop'] += 1
+                  if len(chain) >= 2:
+                      lat0 = chain[0][1]
+                  elif seq:
+                      lat0 = stops[seq[0]]['lat']
+                  else:
+                      continue
+                  kx, ky = local_proj(lat0)
+                  if len(chain) >= 2 and jumps and mode != 'ferry' and len(seq) >= 2:
+                      big = [k for k in jumps if hav_km(chain[k - 1], chain[k]) > GAP_OK[mode]]
+                      if big:
+                          better = chain_by_stops(R, rel, seq, stops, kx, ky, near)
+                          if better and len(better[0]) >= 2:
+                              nb = [k for k in better[1] if hav_km(better[0][k - 1], better[0][k]) > GAP_OK[mode]]
+                              if len(nb) < len(big):
+                                  chain, jumps = better
+                                  fixed['line rebuilt from its stops'] += 1
+                  if len(chain) >= 2 and jumps and mode == 'bus':
+                      chain, jumps, nj = join_gaps(chain, jumps, roads)
+                      if nj:
+                          fixed['gaps joined along the roads'] += 1
+
+                  def P(lon, lat):
+                      return (lon * kx, lat * ky)
+                  placed = []   # [(stop id, s along the line)]
+                  if len(chain) >= 2:
+                      xy = np.array([P(lon, lat) for lon, lat in chain])
+                      L = np.hypot(*(xy[1:] - xy[:-1]).T)
+                      cum = np.concatenate([[0.0], np.cumsum(L)])
                       # (lots of bus routes only list their two ends: then it's the stops it passes on the way)
-                      run = sum(hav_km(chain[i - 1], chain[i]) for i in range(1, len(chain)))
-                      if run / max(1, len(seq) - 1) > 1.0:
+                      if t['route'] in ('bus', 'trolleybus', 'minibus', 'tram') and cum[-1] / max(1, len(seq) - 1) > 1.0:
                           if loose is None:
                               loose = defaultdict(list)
                               for s in stops.values():
                                   loose[(int(s['lon'] / 0.003), int(s['lat'] / 0.003))].append(s)
-                          along = stops_along(chain, loose, [stops[x] for x in seq])
-                          # (the way the relation lists its stops is the way it goes)
-                          if len(seq) >= 2 and seq[0] in along and seq[-1] in along and along.index(seq[0]) > along.index(seq[-1]):
-                              along.reverse()
-                          if len(along) > len(seq):
-                              seq = []
-                              for sid in along:
-                                  if not seq or seq[-1] != sid:
-                                      seq.append(sid)
+                          seen = set(seq)
+                          for lon, lat in chain[::2]:
+                              gx, gy = int(lon / 0.003), int(lat / 0.003)
+                              for dx in (-1, 0, 1):
+                                  for dy in (-1, 0, 1):
+                                      for s in loose.get((gx + dx, gy + dy), ()):
+                                          if s['id'] not in seen:
+                                              seen.add(s['id'])
+                                              ps = passes(xy, cum, P(s['lon'], s['lat']), 0.035)
+                                              if ps:
+                                                  placed.append((s['id'], ps[0][0]))
+                          for sid in seq:
+                              ps = passes(xy, cum, P(stops[sid]['lon'], stops[sid]['lat']), max(near, 0.4))
+                              if ps:
+                                  placed.append((sid, ps[0][0]))
+                          placed.sort(key=lambda x: x[1])
+                          fixed['stops found along it'] += 1
+                      else:
+                          cands = [passes(xy, cum, P(stops[sid]['lon'], stops[sid]['lat']), near) for sid in seq]
+                          on = sum(1 for c in cands if c)
+                          best = in_order(cands)
+                          if on >= 2 and len(best) < 0.8 * on:
+                              # (the line might have been put together the other way round)
+                              rc = chain[::-1]
+                              rxy = xy[::-1].copy()
+                              rL = np.hypot(*(rxy[1:] - rxy[:-1]).T)
+                              rcum = np.concatenate([[0.0], np.cumsum(rL)])
+                              rcands = [passes(rxy, rcum, P(stops[sid]['lon'], stops[sid]['lat']), near) for sid in seq]
+                              rbest = in_order(rcands)
+                              if len(rbest) > len(best):
+                                  chain, xy, cum, cands, best = rc, rxy, rcum, rcands, rbest
+                                  jumps = sorted(len(rc) - k for k in jumps)
+                          if on >= 2 and len(best) >= 0.8 * on:
+                              placed = [(seq[k], s) for k, s in best]
+                              if len(best) < len(seq):
+                                  fixed['stops off its line dropped'] += 1
+                          elif on >= 2:
+                              # (the list is in no useful order: each stop where the route first gets to it)
+                              placed = sorted(((sid, c[0][0]) for sid, c in zip(seq, cands) if c), key=lambda x: x[1])
+                              fixed['stops put in order'] += 1
+                  else:
+                      if mode != 'ferry' and mode != 'train':
+                          fixed['no line: left out'] += 1
+                          continue
+                      placed = [(sid, None) for sid in seq]
                   # (the same stop twice in a row: both sides of the road, or stands at a bus station)
                   tidy = []
-                  for sid in seq:
+                  for sid, sv in placed:
                       if tidy:
-                          a, b = stops[tidy[-1]], stops[sid]
+                          a, b = stops[tidy[-1][0]], stops[sid]
                           d = hav_km((a['lon'], a['lat']), (b['lon'], b['lat']))
-                          if d < 0.1 or (d < 0.5 and name_key(a['name']) and name_key(a['name']) == name_key(b['name'])):
+                          if sid == tidy[-1][0] or d < 0.1 or (d < 0.5 and name_key(a['name']) and name_key(a['name']) == name_key(b['name'])):
                               continue
-                      tidy.append(sid)
-                  seq = tidy
-                  if len(set(seq)) < 2:
+                      tidy.append((sid, sv))
+                  placed = tidy
+                  if len(set(sid for sid, _ in placed)) < 2:
                       continue
-                  lat0 = stops[seq[0]]['lat']
-                  kx, ky = local_proj(lat0)
-
-                  def P(lon, lat):
-                      return (lon * kx, lat * ky)
-                  segs = [[] for _ in seq]
+                  # the line between each stop and the next; a gap too big to join splits the route
+                  segs = [[] for _ in placed]
+                  ok = [True] * len(placed)
                   if len(chain) >= 2:
-                      xy = np.array([P(lon, lat) for lon, lat in chain])
-                      s_prev, svals, dists = 0.0, [], []
-                      cum = None
-                      for sid in seq:
-                          st = stops[sid]
-                          s, d, cum = project_along(xy, P(st['lon'], st['lat']), s_prev)
-                          if d > 0.3:
-                              s = s_prev
-                          svals.append(s)
-                          dists.append(d)
-                          s_prev = s
-                      for i in range(1, len(seq)):
-                          if dists[i] > 0.3 or dists[i - 1] > 0.3:
+                      jump_s = [(cum[k - 1], cum[k]) for k in jumps]
+                      for i in range(1, len(placed)):
+                          s0, s1 = placed[i - 1][1], placed[i][1]
+                          if any(a < s1 and b > s0 and b - a > GAP_OK[mode] for a, b in jump_s):
+                              ok[i] = False
                               continue
-                          pts = piece(xy, cum, svals[i - 1], svals[i])
-                          segs[i] = [(x / kx, y / ky) for x, y in pts]
+                          segs[i] = [(x / kx, y / ky) for x, y in piece(xy, cum, s0, s1)]
+                  if not all(ok[1:]):
+                      # (the longest run of stops joined by road all the way)
+                      best_lo, best_hi, lo = 0, 0, 0
+                      for i in range(1, len(placed)):
+                          if not ok[i]:
+                              lo = i
+                          elif i - lo > best_hi - best_lo:
+                              best_lo, best_hi = lo, i
+                      if best_hi - best_lo < 1:
+                          fixed['no road between stops: left out'] += 1
+                          continue
+                      placed = placed[best_lo:best_hi + 1]
+                      segs = [[]] + segs[best_lo + 1:best_hi + 1]
+                      fixed['gap in its line: kept the longest part'] += 1
+                  seq = [sid for sid, _ in placed]
                   # (simplify each piece: about 4 m)
                   km = [0.0]
                   enc = [[]]
@@ -805,34 +1486,7 @@ jobs:
                   out.append({'id': 'r' + str(rid), 'rid': rid, 'mode': mode, 'ref': ref[:12], 'name': name[:60], 'col': col,
                               'op': (t.get('operator') or mt.get('operator') or '')[:40], 'net': (t.get('network') or mt.get('network') or '')[:40],
                               'master': m[0] if m else None, 'stops': seq, 'g': enc, 'km': km, 'total': sum(km)})
-              log('routes with at least two stops', len(out))
-              return out
-
-
-          def stops_along(chain, grid, extra=()):
-              lat0 = chain[0][1]
-              kx, ky = local_proj(lat0)
-              xy = np.array([(lon * kx, lat * ky) for lon, lat in chain])
-              seen, cand = set(), []
-              for lon, lat in chain[::2]:
-                  gx, gy = int(lon / 0.003), int(lat / 0.003)
-                  for dx in (-1, 0, 1):
-                      for dy in (-1, 0, 1):
-                          for s in grid.get((gx + dx, gy + dy), ()):
-                              if s['id'] not in seen:
-                                  seen.add(s['id'])
-                                  cand.append(s)
-              along = []
-              must = set(s['id'] for s in extra)
-              for s in list(extra) + [c for c in cand if c['id'] not in must]:
-                  sv, d, _ = project_along(xy, (s['lon'] * kx, s['lat'] * ky), 0.0)
-                  if d <= 0.035 or (s['id'] in must and d <= 0.4):
-                      along.append((sv, s['id']))
-              along.sort()
-              out = []
-              for _, sid in along:
-                  if not out or out[-1] != sid:
-                      out.append(sid)
+              log('routes with at least two stops', len(out), dict(fixed))
               return out
 
 
@@ -847,18 +1501,21 @@ jobs:
                   else:
                       key = ('n', r['mode'], r['name'])
                   groups[key].append(r)
-              keep = []
+              keep, alias = [], {}
               for key, rs in groups.items():
                   rs.sort(key=lambda r: (-len(r['stops']), -r['total'], r['rid']))
                   kept = []
                   for r in rs:
                       s = set(r['stops'])
-                      if any(len(s & set(k['stops'])) / max(1, len(s)) >= 0.5 for k in kept):
+                      share = [(len(s & set(k['stops'])) / max(1, len(s)), k['id']) for k in kept]
+                      same = max(share) if share else (0, None)
+                      if same[0] >= 0.5:
+                          alias[r['id']] = same[1]
                           continue
                       kept.append(r)
                   keep += kept
               log('routes after merging directions', len(keep), 'from', len(routes))
-              return keep
+              return keep, alias
 
 
           # ---------------------------------------------------------------- step 5: places (council areas)
@@ -1337,11 +1994,16 @@ jobs:
               R = Reader()
               R.relations(filtered)
               R.everything(filtered)
-              if not a.keep_filtered:
-                  os.remove(filtered)
 
               stops, stop_of = build_stops(R)
-              routes = pick_routes(build_routes(R, stops, stop_of))
+              # (first time round: which gaps in bus routes need joining along the roads; then the roads round them)
+              roads = Roads()
+              build_routes(R, stops, stop_of, roads)
+              roads.load(filtered)
+              if not a.keep_filtered:
+                  os.remove(filtered)
+              routes, aliases = pick_routes(build_routes(R, stops, stop_of, roads))
+              del roads
               used = set()
               for r in routes:
                   for i, sid in enumerate(r['stops']):
@@ -1378,7 +2040,11 @@ jobs:
                                 len(stops[sid]['routes']), stops[sid]['modes']] for sid in r['stops']],
                          'g': r['g'], 'km': r['km']}
                   write_json(os.path.join(out, 'r', f"{r['rid'] % 100:02d}", r['id'] + '.json'), doc)
-              log('wrote routes', len(routes))
+              # (the other direction of a route, and any route merged into another: which one it is now,
+              # so a game that has it carries on with that)
+              for old, new in aliases.items():
+                  write_json(os.path.join(out, 'r', f"{int(old[1:]) % 100:02d}", old + '.json'), {'v': 2, 'id': old, 'alias': new})
+              log('wrote routes', len(routes), 'and', len(aliases), 'other directions pointing at them')
 
               # places
               pdoc = []
