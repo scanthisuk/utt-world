@@ -259,6 +259,11 @@ jobs:
               return out
 
 
+          def pkey(p):
+              """a point of the map (lon, lat) as a key: the data has them to 7 places"""
+              return (round(p[0] * 1e7), round(p[1] * 1e7))
+
+
           class UF:
               def __init__(self):
                   self.p = {}
@@ -357,6 +362,7 @@ jobs:
                    ('landuse', 'cemetery'), ('landuse', 'village_green'), ('natural', 'wood'), ('natural', 'heath')}
           SAND = {('natural', 'beach'), ('natural', 'sand')}
           # (1 motorways and trunk roads, 2 A roads, 3 B roads, 4 smaller roads, 5 streets)
+          ROUTE_ONLY_ROADS = {'service', 'pedestrian', 'bus_guideway', 'track'}
           ROAD_CLASS = {'motorway': 1, 'motorway_link': 1, 'trunk': 1, 'trunk_link': 1, 'primary': 2, 'primary_link': 2,
                         'secondary': 3, 'secondary_link': 3, 'tertiary': 4, 'tertiary_link': 4, 'unclassified': 4, 'busway': 4,
                         'residential': 5, 'living_street': 5, 'road': 5}
@@ -394,6 +400,7 @@ jobs:
                   self.sights = []          # (name, lon, lat, kind)
                   self.coast = []           # coastline ways (land on their left), np arrays lon/lat
                   self.airports = []        # (iata, name, lon, lat)
+                  self.rounds = []          # roundabouts: (first point, last point, x0, y0, x1, y1, its points if a route uses it)
 
               def relations(self, path):
                   for r in osmium.FileProcessor(path, osmium.osm.RELATION):
@@ -454,7 +461,22 @@ jobs:
                                       self.coast.append(c)
                               except Exception:
                                   pass
+                          if hw and t.get('junction') in ('roundabout', 'circular'):
+                              try:
+                                  c = [(n.location.lon, n.location.lat) for n in o.nodes]
+                              except osmium.InvalidLocationError:
+                                  c = None
+                              if c and len(c) >= 2:
+                                  lons, lats = [q[0] for q in c], [q[1] for q in c]
+                                  self.rounds.append((pkey(c[0]), pkey(c[-1]), min(lons), min(lats), max(lons), max(lats),
+                                                      [pkey(q) for q in c] if o.id in self.need_ways else None))
                           cls = ROAD_CLASS.get(hw) or RAIL_CLASS.get(rw) or RIVER_CLASS.get(ww)
+                          # (a road a bus route uses that isn't a kind that's drawn, like a bus station's way
+                          # in or a high street just for buses and people: drawn as a street, so no bus
+                          # route runs where there's no road on the map)
+                          if not cls and hw in ROUTE_ONLY_ROADS and o.id in self.need_ways and t.get('area') != 'yes' and \
+                                  t.get('public_transport') != 'platform':
+                              cls = 5
                           if o.id in self.need_ways or cls:
                               try:
                                   g = shapely.from_wkb(wkb.create_linestring(o))
@@ -1300,10 +1322,67 @@ jobs:
           GAP_OK = {'bus': 0.5, 'tram': 0.5, 'metro': 1.0, 'train': 1.5, 'ferry': 1e9}
 
 
+          def roundabout_middles(rounds):
+              """the points of each roundabout a route goes round (one small enough to go straight across)
+              -> its middle: a route's line goes through the middle, like on a transport map, so routes
+              going round it different ways (or in and out at different sides) meet there instead of
+              splitting round it"""
+              uf = UF()
+              first = {}
+              for k, r in enumerate(rounds):
+                  uf.find(k)
+                  for e in (r[0], r[1]):
+                      j = first.setdefault(e, k)
+                      if j != k:
+                          uf.union(j, k)
+              boxes = {}
+              for k, r in enumerate(rounds):
+                  g = uf.find(k)
+                  b = boxes.get(g)
+                  boxes[g] = (min(b[0], r[2]), min(b[1], r[3]), max(b[2], r[4]), max(b[3], r[5])) if b else r[2:6]
+              at = {}
+              for k, r in enumerate(rounds):
+                  if r[6] is None:
+                      continue
+                  b = boxes[uf.find(k)]
+                  # (a big one's middle can be buildings or a park: routes keep going round that)
+                  if hav_km((b[0], b[1]), (b[2], b[3])) > 0.11:
+                      continue
+                  mid = ((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+                  for q in r[6]:
+                      at[q] = mid
+              return at
+
+
+          def through_middles(pts, at):
+              """a line that goes round a roundabout (two or more of its points in a row) goes through its
+              middle instead"""
+              if not at or len(pts) < 2:
+                  return pts
+              keys = [at.get(pkey(p)) for p in pts]
+              out, k, n = [], 0, len(pts)
+              while k < n:
+                  c = keys[k]
+                  if c is None:
+                      out.append(pts[k])
+                      k += 1
+                      continue
+                  j = k
+                  while j + 1 < n and keys[j + 1] == c:
+                      j += 1
+                  if j > k:
+                      out.append(c)
+                  else:
+                      out.append(pts[k])
+                  k = j + 1
+              return out
+
+
           def build_routes(R, stops, stop_of, roads=None):
               out = []
               loose = None
               fixed = Counter()
+              round_at = getattr(R, 'round_at', None)
               for rid, rel in R.routes.items():
                   t = rel['tags']
                   mode = ROUTE_MODES[t['route']]
@@ -1462,7 +1541,7 @@ jobs:
                   enc = [[]]
                   for i in range(1, len(seq)):
                       a, b = stops[seq[i - 1]], stops[seq[i]]
-                      pts = [(a['lon'], a['lat'])] + segs[i] + [(b['lon'], b['lat'])]
+                      pts = [(a['lon'], a['lat'])] + through_middles(segs[i], round_at) + [(b['lon'], b['lat'])]
                       if len(pts) > 2:
                           ls = LineString([P(*p) for p in pts]).simplify(0.004)
                           pts = [(x / kx, y / ky) for x, y in ls.coords]
@@ -1818,12 +1897,12 @@ jobs:
 
 
           def budget_tris(u, tol, min_area, budget):
-              """simplify more and more until the tile's shapes are at most `budget` triangles (chunky, and cheap to draw)"""
+              """simplify (a little more each time) until the tile's shapes are at most `budget` triangles"""
               if u is None:
                   return []
-              for k in range(6):
-                  t = tol * (1.6 ** k)
-                  m = min_area * (1.8 ** k)
+              for k in range(8):
+                  t = tol * (1.35 ** k)
+                  m = min_area * (1.5 ** k)
                   g = u.simplify(t, preserve_topology=True)
                   keep = [p for p in shapely.get_parts(g) if p.geom_type == 'Polygon' and p.area >= m]
                   if not keep:
@@ -1997,6 +2076,9 @@ jobs:
               R = Reader()
               R.relations(filtered)
               R.everything(filtered)
+              R.round_at = roundabout_middles(R.rounds)
+              log('roundabouts', len(R.rounds), 'ways;', len(R.round_at), 'points of ones routes go through the middle of')
+              R.rounds = None
 
               stops, stop_of = build_stops(R)
               # (first time round: which gaps in bus routes need joining along the roads; then the roads round them)
@@ -2148,9 +2230,11 @@ jobs:
                           doc['s'].append([s['id'], lx, ly, s['name'], s['modes'], pidx[s['place']], [ridx[r] for r in s['routes']]])
                       doc['p'] = plist
                   try:
-                      doc['w'] = budget_tris(layer_shape(bw.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, TZ))), x, y, TZ, 4.0, 300), 6.0, 400, 450)
-                      doc['g'] = budget_tris(layer_shape(bg.get((x, y)), x, y, TZ, 6.0, 3000, merge=8.0), 8.0, 4000, 550)
-                      doc['b'] = budget_tris(layer_shape(bs.get((x, y)), x, y, TZ, 6.0, 3000), 8.0, 4000, 120)
+                      # (water and parks with their real shapes: enough triangles that lakes and rivers
+                      # don't come out as shards)
+                      doc['w'] = budget_tris(layer_shape(bw.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, TZ))), x, y, TZ, 3.0, 300), 3.0, 300, 1600)
+                      doc['g'] = budget_tris(layer_shape(bg.get((x, y)), x, y, TZ, 5.0, 3000, merge=8.0), 5.0, 3000, 1400)
+                      doc['b'] = budget_tris(layer_shape(bs.get((x, y)), x, y, TZ, 5.0, 3000), 5.0, 3000, 300)
                       doc['l'] = chunked_lines(bl.get((x, y), []), x, y, TZ, 5.0, {1, 2, 3, 8})
                   except Exception as e:
                       log('  map for tile', x, y, 'failed:', e)
