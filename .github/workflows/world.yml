@@ -304,11 +304,29 @@ jobs:
               ('railway', 'rail'), ('railway', 'light_rail'), ('railway', 'subway'), ('railway', 'tram'),
               ('aeroway', 'aerodrome'), ('natural', 'coastline'),
           ] + [('tourism', v) for v in ('attraction', 'museum', 'zoo', 'theme_park', 'gallery', 'aquarium')] + \
-              [('historic', 'castle'), ('leisure', 'stadium'), ('building', 'cathedral')]
-          SIGHT_PAIRS = {('tourism', 'attraction'): 'sight', ('tourism', 'museum'): 'museum', ('tourism', 'zoo'): 'zoo',
-                         ('tourism', 'theme_park'): 'park', ('tourism', 'gallery'): 'museum', ('tourism', 'aquarium'): 'zoo',
-                         ('historic', 'castle'): 'castle', ('leisure', 'stadium'): 'stadium',
-                         ('building', 'cathedral'): 'church'}
+              [('historic', 'castle'), ('leisure', 'stadium'), ('building', 'cathedral')] + \
+              [('leisure', 'water_park'), ('historic', 'fort'), ('building', 'palace'), ('shop', 'mall'), ('amenity', 'university'),
+               ('amenity', 'hospital'), ('amenity', 'theatre'), ('amenity', 'arts_centre'), ('historic', 'manor'),
+               ('historic', 'ruins'), ('historic', 'monument'), ('historic', 'city_gate'), ('historic', 'tower'),
+               ('man_made', 'lighthouse'), ('man_made', 'pier')]
+          # landmarks: things with a name and a Wikidata entry (so they're known), by kind; the first that
+          # fits wins, so the special kinds come before the general ones
+          SIGHT_PAIRS = {('historic', 'castle'): 'castle', ('historic', 'fort'): 'castle', ('building', 'palace'): 'castle',
+                         ('tourism', 'zoo'): 'zoo', ('tourism', 'aquarium'): 'zoo',
+                         ('tourism', 'theme_park'): 'fun', ('leisure', 'water_park'): 'fun',
+                         ('leisure', 'stadium'): 'stadium',
+                         ('tourism', 'museum'): 'museum', ('tourism', 'gallery'): 'museum',
+                         ('building', 'cathedral'): 'church',
+                         ('shop', 'mall'): 'shops', ('amenity', 'university'): 'uni', ('amenity', 'hospital'): 'hospital',
+                         ('amenity', 'theatre'): 'theatre', ('amenity', 'arts_centre'): 'theatre',
+                         ('historic', 'manor'): 'historic', ('historic', 'ruins'): 'historic', ('historic', 'monument'): 'historic',
+                         ('historic', 'city_gate'): 'historic', ('historic', 'tower'): 'historic',
+                         ('tourism', 'attraction'): 'sight', ('man_made', 'lighthouse'): 'sight', ('man_made', 'pier'): 'sight',
+                         ('leisure', 'park'): 'park', ('leisure', 'garden'): 'park', ('leisure', 'nature_reserve'): 'park'}
+          # which are kept when a place has lots (lower first; ones with a Wikipedia page first)
+          SIGHT_RANK = {'stadium': 0, 'zoo': 0, 'fun': 0, 'castle': 1, 'museum': 1, 'sight': 2, 'shops': 2, 'church': 3,
+                        'uni': 3, 'hospital': 4, 'theatre': 4, 'historic': 5, 'park': 6}
+          SIGHTS_PER_PLACE = 30
 
 
           def sight_kind(t):
@@ -318,6 +336,10 @@ jobs:
                   if t.get(k) == v:
                       return kind
               return None
+
+
+          def sight_rank(t, kind):
+              return SIGHT_RANK.get(kind, 9) * 2 + (0 if t.get('wikipedia') else 1)
           PLACE_NODE = {'city', 'town', 'village'}
 
 
@@ -397,7 +419,7 @@ jobs:
                   self.areas = {'w': [], 'g': [], 's': []}
                   self.lines = []           # (class, shapely LineString lon/lat)
                   self.admin = []           # (id, name, level, population, polygon)
-                  self.sights = []          # (name, lon, lat, kind, OpenStreetMap id)
+                  self.sights = []          # (name, lon, lat, kind, OpenStreetMap id, rank)
                   self.coast = []           # coastline ways (land on their left), np arrays lon/lat
                   self.airports = []        # (iata, name, lon, lat)
                   self.rounds = []          # roundabouts: (first point, last point, x0, y0, x1, y1, its points if a route uses it)
@@ -446,7 +468,8 @@ jobs:
                               continue
                           sk = sight_kind(t)
                           if sk:
-                              self.sights.append((t.get('name:en') or t.get('name'), o.location.lon, o.location.lat, sk, 'n' + str(o.id)))
+                              self.sights.append((t.get('name:en') or t.get('name'), o.location.lon, o.location.lat, sk, 'n' + str(o.id),
+                                                  sight_rank(t, sk)))
                           if t.get('aeroway') == 'aerodrome' and t.get('iata'):
                               self.airports.append((t.get('iata'), t.get('name:en') or t.get('name') or t.get('iata'), o.location.lon, o.location.lat))
                           if o.id in self.need_nodes or is_stopish(t):
@@ -512,7 +535,7 @@ jobs:
                                   c = shapely.from_wkb(wkb.create_multipolygon(o)).representative_point()
                                   if sk:
                                       self.sights.append((t.get('name:en') or t.get('name'), c.x, c.y, sk,
-                                                          ('w' if o.from_way() else 'r') + str(o.orig_id())))
+                                                          ('w' if o.from_way() else 'r') + str(o.orig_id()), sight_rank(t, sk)))
                                   if apt:
                                       self.airports.append((t.get('iata'), t.get('name:en') or t.get('name') or t.get('iata'), c.x, c.y))
                               except Exception:
@@ -2295,15 +2318,20 @@ jobs:
               sights_by_tile = defaultdict(list)
               seen_s = set()
               uniq = []
-              for nm, lon, lat, kind, oid in R.sights:
+              for nm, lon, lat, kind, oid, rank in sorted(R.sights, key=lambda s: s[5]):
                   key = (nm, round(lon, 3), round(lat, 3))
                   if key in seen_s:
                       continue
                   seen_s.add(key)
-                  uniq.append((nm, lon, lat, kind, oid))
-              # (the place each is in: you buy it once you own the place)
-              sight_place = places_of_points(places, [(lon, lat) for _, lon, lat, _, _ in uniq])
-              for (nm, lon, lat, kind, oid), pid in zip(uniq, sight_place):
+                  uniq.append((nm, lon, lat, kind, oid, rank))
+              # (the place each is in: you buy it once you own the place; a place keeps its best few)
+              sight_place = places_of_points(places, [(lon, lat) for _, lon, lat, _, _, _ in uniq])
+              kept_in = defaultdict(int)
+              for (nm, lon, lat, kind, oid, rank), pid in zip(uniq, sight_place):
+                  if pid:
+                      if kept_in[pid] >= SIGHTS_PER_PLACE:
+                          continue
+                      kept_in[pid] += 1
                   t = tile_of(lon, lat, TZ)
                   if t in want:
                       sights_by_tile[t].append((nm[:50], lon, lat, kind, oid, pid or ''))
