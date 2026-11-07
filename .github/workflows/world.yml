@@ -397,7 +397,7 @@ jobs:
                   self.areas = {'w': [], 'g': [], 's': []}
                   self.lines = []           # (class, shapely LineString lon/lat)
                   self.admin = []           # (id, name, level, population, polygon)
-                  self.sights = []          # (name, lon, lat, kind)
+                  self.sights = []          # (name, lon, lat, kind, OpenStreetMap id)
                   self.coast = []           # coastline ways (land on their left), np arrays lon/lat
                   self.airports = []        # (iata, name, lon, lat)
                   self.rounds = []          # roundabouts: (first point, last point, x0, y0, x1, y1, its points if a route uses it)
@@ -446,7 +446,7 @@ jobs:
                               continue
                           sk = sight_kind(t)
                           if sk:
-                              self.sights.append((t.get('name:en') or t.get('name'), o.location.lon, o.location.lat, sk))
+                              self.sights.append((t.get('name:en') or t.get('name'), o.location.lon, o.location.lat, sk, 'n' + str(o.id)))
                           if t.get('aeroway') == 'aerodrome' and t.get('iata'):
                               self.airports.append((t.get('iata'), t.get('name:en') or t.get('name') or t.get('iata'), o.location.lon, o.location.lat))
                           if o.id in self.need_nodes or is_stopish(t):
@@ -511,7 +511,8 @@ jobs:
                               try:
                                   c = shapely.from_wkb(wkb.create_multipolygon(o)).representative_point()
                                   if sk:
-                                      self.sights.append((t.get('name:en') or t.get('name'), c.x, c.y, sk))
+                                      self.sights.append((t.get('name:en') or t.get('name'), c.x, c.y, sk,
+                                                          ('w' if o.from_way() else 'r') + str(o.orig_id())))
                                   if apt:
                                       self.airports.append((t.get('iata'), t.get('name:en') or t.get('name') or t.get('iata'), c.x, c.y))
                               except Exception:
@@ -1572,8 +1573,24 @@ jobs:
               return out
 
 
-          def pick_routes(routes):
-              """one route per real route (its longest direction), plus any branch that's really different"""
+          RAIL_MODES = {'metro', 'train', 'tram'}
+
+
+          def station_name(nm):
+              """a station's name to compare by: 'Manchester Piccadilly (Tram)' and 'Manchester Piccadilly' are one"""
+              nm = re.sub(r'\(.*?\)', ' ', (nm or '').lower())
+              nm = re.sub(r'\b(station|stn|tram stop|stop|metrolink|rail|railway|underground|platforms?\s*\w*|interchange)\b', ' ', nm)
+              nm = re.sub(r'[^a-z0-9]+', ' ', nm).strip()
+              return nm if len(nm) >= 3 and re.search(r'[a-z]', nm) else ''
+
+
+          def pick_routes(routes, stops=None):
+              """one route per real route (its longest direction), plus any branch that's really different.
+              A bus route's other ways round (most of its stops already in one kept) are folded into it. A
+              rail line keeps every branch that goes somewhere the ones kept don't: a different end, or a
+              run of stations of its own (the Met to Uxbridge, Amersham and Watford, the Piccadilly to
+              Heathrow, the Central to Ealing), and folds in only the other direction of one, or a short
+              working along one"""
               groups = defaultdict(list)
               for r in routes:
                   if r['master']:
@@ -1587,14 +1604,42 @@ jobs:
               for key, rs in groups.items():
                   rs.sort(key=lambda r: (-len(r['stops']), -r['total'], r['rid']))
                   kept = []
+                  cover = []  # (lon, lat, name) of the stations on the rail routes kept
                   for r in rs:
                       s = set(r['stops'])
                       share = [(len(s & set(k['stops'])) / max(1, len(s)), k['id']) for k in kept]
                       same = max(share) if share else (0, None)
-                      if same[0] >= 0.5:
+                      if r['mode'] in RAIL_MODES and stops is not None:
+                          # (a station is the same one if it's the same stop, one right next to it, or one
+                          # nearby with the same name: each way round a tram line has its own platforms)
+                          def known(sid, among):
+                              st = stops[sid]
+                              nm = station_name(st['name'])
+                              for lon, lat, cn in among:
+                                  d = hav_km((lon, lat), (st['lon'], st['lat']))
+                                  if d < 0.15 or (nm and nm == cn and d < 1.5):
+                                      return True
+                              return False
+                          fresh = sum(1 for sid in r['stops'] if not known(sid, cover))
+                          new_end = not known(r['stops'][0], cover) or not known(r['stops'][-1], cover)
+                          folded = bool(kept) and not new_end and fresh < 3
+                          if folded:
+                              best = (-1, None)
+                              for k in kept:
+                                  kc = [(stops[x]['lon'], stops[x]['lat'], station_name(stops[x]['name'])) for x in k['stops']]
+                                  n = sum(1 for sid in r['stops'] if known(sid, kc))
+                                  if n > best[0]:
+                                      best = (n, k['id'])
+                              same = (1, best[1])
+                      else:
+                          folded = same[0] >= 0.5
+                      if folded:
                           alias[r['id']] = same[1]
                           continue
+                      r['grp'] = key
                       kept.append(r)
+                      if stops is not None:
+                          cover += [(stops[x]['lon'], stops[x]['lat'], station_name(stops[x]['name'])) for x in r['stops']]
                   keep += kept
               log('routes after merging directions', len(keep), 'from', len(routes))
               return keep, alias
@@ -1636,6 +1681,29 @@ jobs:
                   out.append({'id': 'a' + str(aid), 'name': name, 'level': lvl, 'pop': pop, 'geom': g, 'stops': 0, 'routes': 0})
               log('places', len(out), 'stops placed', len(place_of), 'of', len(ids))
               return out, place_of
+
+
+          def places_of_points(places, pts):
+              """the place (id) each (lon, lat) is in: the most local one it's inside, else the nearest within 3 km, else None"""
+              if not places or not pts:
+                  return [None] * len(pts)
+              polys = [p['geom'] for p in places]
+              tree = STRtree(polys)
+              gp = shapely.points([q[0] for q in pts], [q[1] for q in pts])
+              out = [None] * len(pts)
+              lvl = [-1] * len(pts)
+              pi, ai = tree.query(gp, predicate='within')
+              for i, a in zip(pi.tolist(), ai.tolist()):
+                  if places[a]['level'] > lvl[i]:
+                      lvl[i] = places[a]['level']
+                      out[i] = places[a]['id']
+              miss = [i for i in range(len(pts)) if out[i] is None]
+              if miss:
+                  near = tree.query_nearest(gp[miss], max_distance=0.03, return_distance=False)
+                  for k, a in zip(near[0].tolist(), near[1].tolist()):
+                      if out[miss[k]] is None:
+                          out[miss[k]] = places[a]['id']
+              return out
 
 
           def enc_rings(geom, tol):
@@ -2100,7 +2168,7 @@ jobs:
               roads.load(filtered)
               if not a.keep_filtered:
                   os.remove(filtered)
-              routes, aliases = pick_routes(build_routes(R, stops, stop_of, roads))
+              routes, aliases = pick_routes(build_routes(R, stops, stop_of, roads), stops)
               del roads
               used = set()
               for r in routes:
@@ -2129,28 +2197,54 @@ jobs:
                   if hp:
                       pl_by[hp]['routes'] += 1
 
-              # routes
+              # routes (each with the other branches of the same line, so the game can show the whole line:
+              # the routes of its line that meet it, or meet one that does)
               rinfo = {}
+              by_grp = defaultdict(list)
+              grp_routes = defaultdict(list)
+              for r in routes:
+                  if r.get('grp') is not None:
+                      grp_routes[r['grp']].append(r)
+              for g, rs in grp_routes.items():
+                  if len(rs) < 2:
+                      continue
+                  up = list(range(len(rs)))
+
+                  def find(i):
+                      while up[i] != i:
+                          up[i] = up[up[i]]
+                          i = up[i]
+                      return i
+                  keys = []
+                  for r in rs:
+                      ks = set(r['stops'])
+                      for sid in r['stops']:
+                          nm = station_name(stops[sid]['name'])
+                          if nm:
+                              ks.add(('n', nm, round(stops[sid]['lat'], 1), round(stops[sid]['lon'], 1)))
+                      keys.append(ks)
+                  for i in range(len(rs)):
+                      for j in range(i + 1, len(rs)):
+                          if keys[i] & keys[j]:
+                              up[find(i)] = find(j)
+                  for i, r in enumerate(rs):
+                      by_grp[(g, find(i))].append(r['id'])
+                      r['line'] = (g, find(i))
               for r in routes:
                   rinfo[r['id']] = r
                   doc = {'v': 2, 'id': r['id'], 'mode': r['mode'], 'ref': r['ref'], 'name': r['name'], 'col': r['col'], 'op': r['op'],
                          's': [[sid, e5(stops[sid]['lat']), e5(stops[sid]['lon']), stops[sid]['name'], stops[sid]['place'],
                                 len(stops[sid]['routes']), stops[sid]['modes']] for sid in r['stops']],
                          'g': r['g'], 'km': r['km']}
+                  sib = [x for x in by_grp[r['line']] if x != r['id']] if r.get('line') is not None else []
+                  if sib:
+                      doc['sib'] = sib[:30]
                   write_json(os.path.join(out, 'r', f"{r['rid'] % 100:02d}", r['id'] + '.json'), doc)
               # (the other direction of a route, and any route merged into another: which one it is now,
               # so a game that has it carries on with that. One file for them all: a Pages site with too
               # many files takes too long to go live)
               write_json(os.path.join(out, 'aliases.json'), {'v': 1, 'a': aliases})
               log('wrote routes', len(routes), 'and', len(aliases), 'other directions pointing at them')
-
-              # places
-              pdoc = []
-              for p in places:
-                  b = p['geom'].bounds
-                  pdoc.append([p['id'], p['name'], p['level'], p['pop'], p['stops'], p['routes'],
-                               [e5(b[1]), e5(b[0]), e5(b[3]), e5(b[2])], enc_rings(p['geom'], 0.0003), enc_rings(p['geom'], 0.003)])
-              write_json(os.path.join(out, 'places.json'), {'v': 1, 'p': pdoc})
 
               # towns you can start in (with at least 3 routes within 2 km)
               grid = defaultdict(list)
@@ -2200,14 +2294,30 @@ jobs:
               bl = bucket(R.lines, TZ, with_cls=True)
               sights_by_tile = defaultdict(list)
               seen_s = set()
-              for nm, lon, lat, kind in R.sights:
+              uniq = []
+              for nm, lon, lat, kind, oid in R.sights:
                   key = (nm, round(lon, 3), round(lat, 3))
                   if key in seen_s:
                       continue
                   seen_s.add(key)
+                  uniq.append((nm, lon, lat, kind, oid))
+              # (the place each is in: you buy it once you own the place)
+              sight_place = places_of_points(places, [(lon, lat) for _, lon, lat, _, _ in uniq])
+              for (nm, lon, lat, kind, oid), pid in zip(uniq, sight_place):
                   t = tile_of(lon, lat, TZ)
                   if t in want:
-                      sights_by_tile[t].append((nm[:50], lon, lat, kind))
+                      sights_by_tile[t].append((nm[:50], lon, lat, kind, oid, pid or ''))
+                      if pid:
+                          pl_by[pid]['sights'] = pl_by[pid].get('sights', 0) + 1
+              # places (with how many sights each has)
+              pdoc = []
+              for p in places:
+                  b = p['geom'].bounds
+                  pdoc.append([p['id'], p['name'], p['level'], p['pop'], p['stops'], p['routes'],
+                               [e5(b[1]), e5(b[0]), e5(b[3]), e5(b[2])], enc_rings(p['geom'], 0.0003), enc_rings(p['geom'], 0.003),
+                               p.get('sights', 0)])
+              write_json(os.path.join(out, 'places.json'), {'v': 1, 'p': pdoc})
+
               apts, seen_a = [], set()
               for iata, nm, lon, lat in R.airports:
                   if iata in seen_a or not re.fullmatch(r'[A-Z]{3}', iata or ''):
@@ -2221,6 +2331,7 @@ jobs:
               for (x, y) in sorted(want):
                   doc = {'v': 2, 'x': x, 'y': y}
                   ss = by_tile.get((x, y), [])
+                  pidx, plist = {}, []
                   if ss:
                       rids = []
                       ridx = {}
@@ -2233,7 +2344,6 @@ jobs:
                                    len(rinfo[rid]['stops']), round(rinfo[rid]['total'], 1)] for rid in rids]
                       n = 1 << TZ
                       doc['s'] = []
-                      pidx, plist = {}, []
                       for s in sorted(ss, key=lambda s: s['id']):
                           lx = int(round((mercx(s['lon']) * n - x) * EXT))
                           ly = int(round((mercy(s['lat']) * n - y) * EXT))
@@ -2241,7 +2351,6 @@ jobs:
                               pidx[s['place']] = len(plist)
                               plist.append(s['place'])
                           doc['s'].append([s['id'], lx, ly, s['name'], s['modes'], pidx[s['place']], [ridx[r] for r in s['routes']]])
-                      doc['p'] = plist
                   try:
                       # (water and parks with their real shapes: enough triangles that lakes and rivers
                       # don't come out as shards)
@@ -2264,7 +2373,15 @@ jobs:
                   ks = sights_by_tile.get((x, y), [])
                   if ks:
                       n = 1 << TZ
-                      doc['k'] = [[nm, int(round((mercx(lon) * n - x) * EXT)), int(round((mercy(lat) * n - y) * EXT)), kind] for nm, lon, lat, kind in ks]
+                      doc['k'] = []
+                      for nm, lon, lat, kind, oid, pid in ks:
+                          if pid and pid not in pidx:
+                              pidx[pid] = len(plist)
+                              plist.append(pid)
+                          doc['k'].append([nm, int(round((mercx(lon) * n - x) * EXT)), int(round((mercy(lat) * n - y) * EXT)), kind, oid,
+                                           pidx[pid] if pid else -1])
+                  if plist:
+                      doc['p'] = plist
                   # (the smaller roads and streets: last in the file, so the server can hand them on
                   # separately, only to players zoomed in far enough to see them)
                   try:
