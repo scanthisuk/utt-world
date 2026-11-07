@@ -1914,8 +1914,10 @@ jobs:
               return out
 
 
-          def layer_shape(geoms, x, y, z, tol, min_area, merge=0.0):
-              """water/green/sand inside a tile, merged, simplified, small bits dropped (tile coords)"""
+          def layer_shape(geoms, x, y, z, tol, min_area, merge=0.0, thin=0.0):
+              """water/green/sand inside a tile, merged, smoothed, simplified, small bits dropped (tile coords).
+              merge: gaps and notches narrower than twice this filled in; thin: spikes, slivers and strips narrower
+              than twice this taken off (so edges don't come out as jagged teeth and shards)"""
               if not geoms:
                   return None
               lon0, lat0, lon1, lat1 = tile_lonlat_box(x, y, z)
@@ -1938,8 +1940,13 @@ jobs:
                   u = shapely.union_all(px)
               except Exception:
                   u = shapely.union_all([shapely.make_valid(p).buffer(0) for p in px])
-              if merge > 0:
-                  u = u.buffer(merge, quad_segs=2).buffer(-merge, quad_segs=2)
+              try:
+                  if merge > 0:
+                      u = u.buffer(merge, quad_segs=3).buffer(-merge, quad_segs=3)
+                  if thin > 0:
+                      u = u.buffer(-thin, quad_segs=3).buffer(thin, quad_segs=3)
+              except Exception:
+                  pass
               u = u.intersection(box(0, 0, EXT, EXT)).simplify(tol, preserve_topology=True)
               keep = [p for p in shapely.get_parts(u) if p.geom_type == 'Polygon' and p.area >= min_area]
               if not keep:
@@ -1947,8 +1954,9 @@ jobs:
               return shapely.MultiPolygon(keep) if len(keep) > 1 else keep[0]
 
 
-          def chunked_lines(items, x, y, z, tol, classes):
-              """roads/rivers inside a tile: joined up into long lines, simplified -> [[chunk, class, deltas...], ...]"""
+          def chunked_lines(items, x, y, z, tol, classes, cut=None):
+              """roads/rivers inside a tile: joined up into long lines, simplified -> [[chunk, class, deltas...], ...]
+              cut: {class: shape} - lines of that class left out where they're inside the shape (a river through its lake)"""
               lon0, lat0, lon1, lat1 = tile_lonlat_box(x, y, z)
               bb = box(lon0, lat0, lon1, lat1)
               by_cls = defaultdict(list)
@@ -1967,6 +1975,11 @@ jobs:
                       merged = shapely.line_merge(shapely.union_all(gs))
                   except Exception:
                       merged = shapely.MultiLineString([q for g in gs for q in shapely.get_parts(g) if q.geom_type == 'LineString'])
+                  if cut and cut.get(cls) is not None:
+                      try:
+                          merged = merged.difference(cut[cls])
+                      except Exception:
+                          pass
                   merged = merged.simplify(tol)
                   for cy in range(CH):
                       for cx in range(CH):
@@ -2232,10 +2245,19 @@ jobs:
                   try:
                       # (water and parks with their real shapes: enough triangles that lakes and rivers
                       # don't come out as shards)
-                      doc['w'] = budget_tris(layer_shape(bw.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, TZ))), x, y, TZ, 3.0, 300), 3.0, 300, 1600)
-                      doc['g'] = budget_tris(layer_shape(bg.get((x, y)), x, y, TZ, 5.0, 3000, merge=8.0), 5.0, 3000, 1400)
-                      doc['b'] = budget_tris(layer_shape(bs.get((x, y)), x, y, TZ, 5.0, 3000), 5.0, 3000, 300)
-                      doc['l'] = chunked_lines(bl.get((x, y), []), x, y, TZ, 5.0, {1, 2, 3, 8})
+                      wshape = layer_shape(bw.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, TZ))), x, y, TZ, 3.0, 300,
+                                           merge=4.0, thin=3.0)
+                      doc['w'] = budget_tris(wshape, 3.0, 300, 1600)
+                      doc['g'] = budget_tris(layer_shape(bg.get((x, y)), x, y, TZ, 5.0, 3000, merge=8.0, thin=6.0), 5.0, 3000, 1400)
+                      doc['b'] = budget_tris(layer_shape(bs.get((x, y)), x, y, TZ, 5.0, 3000, thin=3.0), 5.0, 3000, 300)
+                      # (a river's line stops at the edge of its own water: no second blue line over the top of it)
+                      inner = None
+                      if wshape is not None:
+                          try:
+                              inner = wshape.buffer(-2.0, quad_segs=2)
+                          except Exception:
+                              inner = None
+                      doc['l'] = chunked_lines(bl.get((x, y), []), x, y, TZ, 5.0, {1, 2, 3, 8}, cut={8: inner})
                   except Exception as e:
                       log('  map for tile', x, y, 'failed:', e)
                       doc['w'], doc['g'], doc['b'], doc['l'] = [], [], [], []
