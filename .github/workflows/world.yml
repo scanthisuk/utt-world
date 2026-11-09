@@ -1,6 +1,7 @@
 # Ultimate Transport Tycoon: builds every route in the world for the game, from OpenStreetMap.
 # Actions tab -> "Build world data" -> Run workflow. Type the regions to build (great-britain,
-# ireland-and-northern-ireland, or "all" for the whole world). Once a month it rebuilds every one it's built.
+# ireland-and-northern-ireland, isle-of-man, guernsey-jersey), "built" for every one built so far, or
+# "all" for the whole world. Once a month it rebuilds every one it's built.
 # Map data (c) OpenStreetMap contributors, ODbL.
 name: Build world data
 
@@ -8,8 +9,8 @@ on:
   workflow_dispatch:
     inputs:
       regions:
-        description: 'Which regions (like great-britain or ireland-and-northern-ireland, comma separated), or "all" for the whole world'
-        default: 'ireland-and-northern-ireland'
+        description: 'Which regions (like great-britain or isle-of-man, comma separated), "built" for every one built so far, or "all" for the whole world'
+        default: 'built'
         required: true
   schedule:
     - cron: '17 3 1 * *'
@@ -303,7 +304,7 @@ jobs:
               ('highway', 'motorway_link'), ('highway', 'trunk_link'), ('highway', 'primary_link'), ('highway', 'secondary_link'),
               ('highway', 'tertiary_link'),
               ('railway', 'rail'), ('railway', 'light_rail'), ('railway', 'subway'), ('railway', 'tram'),
-              ('aeroway', 'aerodrome'), ('natural', 'coastline'),
+              ('aeroway', 'aerodrome'), ('natural', 'coastline'), ('route', 'ferry'),
           ] + [('tourism', v) for v in ('attraction', 'museum', 'zoo', 'theme_park', 'gallery', 'aquarium')] + \
               [('historic', 'castle'), ('leisure', 'stadium'), ('building', 'cathedral')] + \
               [('leisure', 'water_park'), ('historic', 'fort'), ('building', 'palace'), ('shop', 'mall'), ('amenity', 'university'),
@@ -334,19 +335,26 @@ jobs:
           PLACE_MAX_LEVEL = {'Ireland': 7}
           # the country a region's places are in when the map has no country boundary for them
           REGION_COUNTRY = {'ireland-and-northern-ireland': 'Ireland', 'ireland': 'Ireland'}
+          # (1.24) small islands: their landmarks needn't have a Wikidata entry, or they'd have hardly any
+          # (Castle Rushen, Mont Orgueil). Those come after the ones that do
+          LOOSE_SIGHT_REGIONS = {'isle-of-man', 'guernsey-jersey'}
+          LOOSE_SIGHT_KINDS = {'castle', 'zoo', 'fun', 'stadium', 'museum', 'church', 'theatre', 'historic', 'sight'}
+          LOOSE_SIGHTS = False
 
 
           def sight_kind(t):
-              if not t.get('name') or not t.get('wikidata'):
+              if not t.get('name'):
                   return None
               for (k, v), kind in SIGHT_PAIRS.items():
                   if t.get(k) == v:
-                      return kind
+                      if t.get('wikidata') or (LOOSE_SIGHTS and kind in LOOSE_SIGHT_KINDS):
+                          return kind
+                      return None
               return None
 
 
           def sight_rank(t, kind):
-              return SIGHT_RANK.get(kind, 9) * 2 + (0 if t.get('wikipedia') else 1)
+              return SIGHT_RANK.get(kind, 9) * 2 + (0 if t.get('wikipedia') else 1) + (0 if t.get('wikidata') else 40)
           PLACE_NODE = {'city', 'town', 'village'}
 
 
@@ -418,6 +426,8 @@ jobs:
                   self.masters = {}         # route relation id -> master tags
                   self.stop_areas = []      # (id, name, [('n', id) / ('w', id)])
                   self.need_ways = set()    # route member ways (geometry) and platform ways
+                  self.route_ways = set()   # the ways of route relations
+                  self.ferry_ways = []      # every ferry line: (way id, tags, lon/lat array, first node, last node)
                   self.need_nodes = set()   # nodes routes and stop areas list
                   self.nodes = {}           # stop-ish node id -> (lon, lat, tags dict)
                   self.way_geom = {}        # way id -> np.array (n, 2) lon/lat
@@ -441,6 +451,7 @@ jobs:
                           for typ, ref, role in mem:
                               if typ == 'w':
                                   self.need_ways.add(ref)
+                                  self.route_ways.add(ref)
                               elif typ == 'n':
                                   self.need_nodes.add(ref)
                       elif ty == 'route_master':
@@ -483,6 +494,13 @@ jobs:
                               self.nodes[o.id] = (o.location.lon, o.location.lat, dict(t))
                       elif o.is_way():
                           t = o.tags
+                          if t.get('route') == 'ferry':
+                              try:
+                                  fc = shapely.get_coordinates(shapely.from_wkb(wkb.create_linestring(o)))
+                                  if len(fc) >= 2:
+                                      self.ferry_ways.append((o.id, dict(t), fc, o.nodes[0].ref, o.nodes[-1].ref))
+                              except Exception:
+                                  pass
                           hw, rw, ww = t.get('highway'), t.get('railway'), t.get('waterway')
                           if t.get('natural') == 'coastline':
                               try:
@@ -563,7 +581,8 @@ jobs:
                           self.areas[k].append(g)
                   log('nodes', len(self.nodes), 'route ways', len(self.way_geom), 'towns', len(self.towns),
                       'water', len(self.areas['w']), 'green', len(self.areas['g']), 'lines', len(self.lines), 'admin', len(self.admin),
-                      'sights', len(self.sights), 'airports', len(self.airports), 'coastline ways', len(self.coast))
+                      'sights', len(self.sights), 'airports', len(self.airports), 'coastline ways', len(self.coast),
+                      'ferry lines', len(self.ferry_ways))
 
 
           # ---------------------------------------------------------------- step 3: stops
@@ -1603,6 +1622,285 @@ jobs:
               return out
 
 
+          # ---------------------------------------------------------------- step 4b: ferries that are only a line
+          # (1.24) Most ferries are on the map as a line and nothing else (the Isle of Man's and the Channel
+          # Islands' all are): a route each. Their ids: r(this + the line's first way's id)
+          FERRY_ID_BASE = 10 ** 11
+          FERRY_SKIP_WORDS = ('freight',)
+
+
+          def ferryish(t):
+              return t.get('amenity') == 'ferry_terminal' or t.get('ferry') == 'yes'
+
+
+          def split_ends(nm):
+              """'Douglas - Heysham' -> ['Douglas', 'Heysham'] (and 'A to B', 'A <> B', 'Operator: A - B')"""
+              nm = re.sub(r'^[^:]{2,40}:\s*', '', nm or '')
+              nm = re.sub(r'\s*\([^)]*\)\s*$', '', nm)
+              parts = [clean_name(x) for x in re.split(r'\s*(?:<=>|<>|=>|->|→|↔| - | – | — | to )\s*', nm, flags=re.I) if x and x.strip()]
+              return parts if len(parts) == 2 else []
+
+
+          FERRY_COMMON = {'ferry', 'ferries', 'terminal', 'port', 'harbour', 'harbor', 'pier', 'the', 'of', 'sea', 'quay', 'dock', 'docks',
+                          'landing', 'stage', 'berth', 'slipway', 'jetty', 'st', 'saint'}
+
+
+          def same_town(a, b):
+              wa = set(re.findall(r'[a-z]+', (a or '').lower())) - FERRY_COMMON
+              wb = set(re.findall(r'[a-z]+', (b or '').lower())) - FERRY_COMMON
+              return bool(wa & wb)
+
+
+          def ferry_routes(R, stops, stop_of, is_home, also_ways):
+              """ferries that are only a line on the map, and route relations whose stops aren't on it
+              (also_ways: their lines): a route each. A ferry in bits joined end to end out at sea is one.
+              Its stops: the terminals it calls at, or else stops of its own at its ends. One that goes over
+              to another region's map has just its two ends, with the line's own end points for ids: the
+              same in both regions' maps, so it's the same route in both"""
+              pool = []
+              for wid, t, c, n0, n1 in R.ferry_ways:
+                  if wid in R.route_ways and wid not in also_ways:
+                      continue
+                  nm = (t.get('name', '') + ' ' + t.get('description', '')).lower()
+                  if any(w in nm for w in SKIP_WORDS + FERRY_SKIP_WORDS) or t.get('disused') == 'yes' or t.get('abandoned') == 'yes' or \
+                          t.get('state') in ('proposed', 'disused') or t.get('access') in ('no', 'private'):
+                      continue
+                  # (freight only: no one to carry)
+                  if t.get('foot') == 'no' and t.get('motorcar', t.get('motor_vehicle', 'no')) == 'no' and t.get('hgv') in ('yes', 'designated'):
+                      continue
+                  pool.append((wid, t, c, n0, n1))
+              if not pool:
+                  return []
+              fixed = Counter()
+              # the terminals ferries call at, and any stop with a name (to name an end after)
+              fstops = set()
+              for nid, (lon, lat, t) in R.nodes.items():
+                  if ferryish(t) and ('n', nid) in stop_of:
+                      fstops.add(stop_of[('n', nid)])
+              for wid, t in R.way_tags.items():
+                  if ferryish(t) and ('w', wid) in stop_of:
+                      fstops.add(stop_of[('w', wid)])
+              fgrid, ngrid, tgrid = defaultdict(list), defaultdict(list), defaultdict(list)
+              for sid in fstops:
+                  st = stops[sid]
+                  if is_home(st['lon'], st['lat']):
+                      fgrid[(int(st['lon'] / 0.01), int(st['lat'] / 0.01))].append(sid)
+              for st in stops.values():
+                  if st['name']:
+                      ngrid[(int(st['lon'] / 0.01), int(st['lat'] / 0.01))].append(st['id'])
+              for tw in R.towns:
+                  tgrid[(int(tw[1] / 0.1), int(tw[2] / 0.1))].append(tw)
+
+              def nearest_stop(grid, lon, lat, km):
+                  best, bd = None, km
+                  gx, gy = int(lon / 0.01), int(lat / 0.01)
+                  for dx in (-1, 0, 1):
+                      for dy in (-1, 0, 1):
+                          for sid in grid.get((gx + dx, gy + dy), ()):
+                              st = stops[sid]
+                              d = hav_km((lon, lat), (st['lon'], st['lat']))
+                              if d < bd or (d == bd and best is not None and sid < best):
+                                  best, bd = sid, d
+                  return best
+
+              def nearest_town(lon, lat, km):
+                  best, bd = None, km
+                  gx, gy = int(lon / 0.1), int(lat / 0.1)
+                  for dx in (-1, 0, 1):
+                      for dy in (-1, 0, 1):
+                          for nm, tlon, tlat, kind, pop in tgrid.get((gx + dx, gy + dy), ()):
+                              d = hav_km((lon, lat), (tlon, tlat)) * (1.5 if kind == 'village' else 1.0)
+                              if d < bd:
+                                  best, bd = nm, d
+                  return best
+
+              # (bits joined end to end where just two meet, out at sea: not at a terminal, where it calls)
+              ends = defaultdict(list)
+              for i, (wid, t, c, n0, n1) in enumerate(pool):
+                  ends[n0].append(i)
+                  if n1 != n0:
+                      ends[n1].append(i)
+              adj = defaultdict(list)
+              for n, lst in ends.items():
+                  if len(lst) == 2 and lst[0] != lst[1]:
+                      i, j = lst
+                      c = pool[i][2]
+                      lon, lat = c[0] if pool[i][3] == n else c[-1]
+                      if nearest_stop(fgrid, float(lon), float(lat), 0.3) is None:
+                          adj[i].append((n, j))
+                          adj[j].append((n, i))
+              out = []
+              done = set()
+              for i in sorted(range(len(pool)), key=lambda k: pool[k][0]):
+                  if i in done:
+                      continue
+                  comp, stack = {i}, [i]
+                  while stack:
+                      k = stack.pop()
+                      for n, j in adj[k]:
+                          if j not in comp:
+                              comp.add(j)
+                              stack.append(j)
+                  done |= comp
+                  tips = [k for k in comp if len(adj[k]) < 2]
+                  start = min(tips or comp, key=lambda k: pool[k][0])
+                  wid, t, c, n0, n1 = pool[start]
+                  jn = {n for n, j in adj[start]}
+                  if n0 in jn and n1 not in jn:
+                      c, a_node, b_node = c[::-1], n1, n0
+                  else:
+                      a_node, b_node = n0, n1
+                  coords = [(float(p[0]), float(p[1])) for p in c]
+                  cur, seen_w = start, {start}
+                  while True:
+                      nxt = next(((n, j) for n, j in adj[cur] if n == b_node and j not in seen_w), None)
+                      if not nxt:
+                          break
+                      n, j = nxt
+                      w2, t2, c2, m0, m1 = pool[j]
+                      if m0 == n:
+                          coords += [(float(p[0]), float(p[1])) for p in c2[1:]]
+                          b_node = m1
+                      else:
+                          coords += [(float(p[0]), float(p[1])) for p in c2[::-1][1:]]
+                          b_node = m0
+                      seen_w.add(j)
+                      cur = j
+                  # (the same way round in every region's map: from the end with the lower id)
+                  if b_node < a_node:
+                      coords = coords[::-1]
+                      a_node, b_node = b_node, a_node
+                  wids = sorted(pool[k][0] for k in comp)
+                  tags = next((pool[k][1] for k in sorted(comp, key=lambda k: pool[k][0]) if pool[k][1].get('name')), pool[start][1])
+                  (a_lon, a_lat), (b_lon, b_lat) = coords[0], coords[-1]
+                  a_home, b_home = is_home(a_lon, a_lat), is_home(b_lon, b_lat)
+                  if not a_home and not b_home:
+                      # (just passing through this region's map, or the other region's to make)
+                      continue
+                  cross = not (a_home and b_home)
+                  kx, ky = local_proj(a_lat)
+                  xy = np.array([(lon * kx, lat * ky) for lon, lat in coords])
+                  L = np.hypot(*(xy[1:] - xy[:-1]).T)
+                  cum = np.concatenate([[0.0], np.cumsum(L)])
+                  total = float(cum[-1])
+                  if total < 0.05:
+                      continue
+
+                  def end_stop(node, lon, lat, home):
+                      if home and not cross:
+                          sid = nearest_stop(fgrid, lon, lat, 0.6)
+                          if sid:
+                              return sid
+                      sid = 'n' + str(node)
+                      if sid not in stops:
+                          # (named after the terminal there: an end with no name gets one below)
+                          k = nearest_stop(fgrid, lon, lat, 0.6) if home else None
+                          stops[sid] = {'id': sid, 'lon': lon, 'lat': lat, 'name': stops[k]['name'] if k else '', 'station': True,
+                                        'modes': 0, 'routes': []}
+                          fixed['stops made at its ends'] += 1
+                      return sid
+                  sa = end_stop(a_node, a_lon, a_lat, a_home)
+                  sb = end_stop(b_node, b_lon, b_lat, b_home)
+                  seq = [(sa, 0.0)]
+                  if not cross:
+                      # (the terminals it calls at on the way)
+                      cand = set()
+                      step = max(1, len(coords) // 400)
+                      for lon, lat in coords[::step] + [coords[-1]]:
+                          gx, gy = int(lon / 0.01), int(lat / 0.01)
+                          for dx in (-1, 0, 1):
+                              for dy in (-1, 0, 1):
+                                  cand.update(fgrid.get((gx + dx, gy + dy), ()))
+                      mids = []
+                      for sid in cand - {sa, sb}:
+                          st = stops[sid]
+                          # (one that goes round and back: not the terminals by the one it starts and ends at)
+                          if sa == sb and hav_km((st['lon'], st['lat']), (stops[sa]['lon'], stops[sa]['lat'])) < 0.6:
+                              continue
+                          ps = passes(xy, cum, (st['lon'] * kx, st['lat'] * ky), 0.3)
+                          if ps:
+                              mids.append((sid, ps[0][0]))
+                      seq += sorted(mids, key=lambda x: (x[1], x[0]))
+                  if sb != sa:
+                      seq.append((sb, total))
+                  tidy = []
+                  for sid, sv in seq:
+                      if tidy:
+                          pa, pb = stops[tidy[-1][0]], stops[sid]
+                          d = hav_km((pa['lon'], pa['lat']), (pb['lon'], pb['lat']))
+                          if sid == tidy[-1][0] or d < 0.1 or (d < 0.5 and name_key(pa['name']) and name_key(pa['name']) == name_key(pb['name'])):
+                              continue
+                      tidy.append((sid, sv))
+                  seq = tidy
+                  if len(set(sid for sid, _ in seq)) < 2:
+                      continue
+                  # an end with no name: the town in the ferry's name that's there (Knott End to Fleetwood),
+                  # else the one the other end isn't, else the town it's in, else the ferry's name in order
+                  fr, to = tags.get('from'), tags.get('to')
+                  towns = [clean_name(fr), clean_name(to)] if fr and to else split_ends(tags.get('name', ''))
+                  first, last = stops[seq[0][0]], stops[seq[-1][0]]
+
+                  def town_there(st, part):
+                      best = None
+                      gx, gy = int(st['lon'] / 0.1), int(st['lat'] / 0.1)
+                      for dx in (-1, 0, 1):
+                          for dy in (-1, 0, 1):
+                              for nm, tlon, tlat, kind, pop in tgrid.get((gx + dx, gy + dy), ()):
+                                  d = hav_km((st['lon'], st['lat']), (tlon, tlat))
+                                  if d < 5.0 and same_town(nm, part) and (best is None or d < best):
+                                      best = d
+                      return best
+                  for this, other, mine in ((first, last, 0), (last, first, 1)):
+                      if this['name']:
+                          continue
+                      home_here = is_home(this['lon'], this['lat'])
+                      if len(towns) == 2:
+                          there = [town_there(this, x) if home_here else None for x in towns]
+                          if there[0] is not None or there[1] is not None:
+                              this['name'] = towns[0] if there[1] is None or (there[0] is not None and there[0] <= there[1]) else towns[1]
+                              continue
+                          if other['name'] and same_town(other['name'], towns[0]) and not same_town(other['name'], towns[1]):
+                              this['name'] = towns[1]
+                              continue
+                          if other['name'] and same_town(other['name'], towns[1]) and not same_town(other['name'], towns[0]):
+                              this['name'] = towns[0]
+                              continue
+                      if home_here:
+                          this['name'] = nearest_town(this['lon'], this['lat'], 8.0) or ''
+                      if not this['name'] and len(towns) == 2:
+                          this['name'] = towns[mine]
+                  for st in (first, last):
+                      if not st['name']:
+                          st['name'] = 'Ferry terminal'
+                  # the line between each stop and the next (about 20 m: a ferry's line is a smooth one)
+                  km, enc = [0.0], [[]]
+                  for i in range(1, len(seq)):
+                      pa, pb = stops[seq[i - 1][0]], stops[seq[i][0]]
+                      mid = piece(xy, cum, seq[i - 1][1], seq[i][1])
+                      pts = [(pa['lon'] * kx, pa['lat'] * ky)] + mid + [(pb['lon'] * kx, pb['lat'] * ky)]
+                      if len(pts) > 2:
+                          pts = list(LineString(pts).simplify(0.02).coords)
+                      pts = [(x / kx, y / ky) for x, y in pts]
+                      km.append(round(max(sum(hav_km(pts[j - 1], pts[j]) for j in range(1, len(pts))), 0.01), 3))
+                      flat, px, py = [], e5(pa['lat']), e5(pa['lon'])
+                      for lon, lat in pts[1:-1]:
+                          qx, qy = e5(lat), e5(lon)
+                          flat += [qx - px, qy - py]
+                          px, py = qx, qy
+                      enc.append(flat)
+                  ref = (tags.get('ref') or '').strip()
+                  nm = clean_name(re.sub(r'^[^:]{2,40}:\s*', '', tags.get('name') or ''))
+                  name = nm or f"{first['name']} - {last['name']}"
+                  col = colour_of(tags.get('colour')) or pick_colour('ferry:' + (ref or name))
+                  rid = FERRY_ID_BASE + wids[0]
+                  out.append({'id': 'r' + str(rid), 'rid': rid, 'mode': 'ferry', 'ref': ref[:12], 'name': name[:60], 'col': col,
+                              'op': (tags.get('operator') or '')[:40], 'net': (tags.get('network') or '')[:40], 'master': None,
+                              'stops': [sid for sid, _ in seq], 'g': enc, 'km': km, 'total': sum(km)})
+                  fixed['to another region' if cross else 'here'] += 1
+              log('ferries that are only a line', len(out), 'from', len(pool), 'lines', dict(fixed))
+              return out
+
+
           RAIL_MODES = {'metro', 'train', 'tram'}
 
 
@@ -1676,9 +1974,11 @@ jobs:
 
 
           # ---------------------------------------------------------------- step 5: places (council areas)
-          def build_places(R, stops, region=''):
+          def build_places(R, stops, region='', extra=()):
               """the place (council area) of each stop, and the country it's in: England, Scotland, Wales,
-              Northern Ireland (their own boundaries), else the country (Ireland), else the region's"""
+              Northern Ireland (their own boundaries), else the country (Ireland), else the region's. And
+              (1.24) a place for each of the extra points ((lon, lat): airports) too, stops or not: an island
+              with an airport and no routes (Alderney)"""
               adm = [a for a in R.admin if a[4] is not None and not a[4].is_empty]
               cand = [a for a in adm if 4 <= a[2] <= 8]
               lands = [a for a in adm if a[2] in (2, 4)]
@@ -1714,6 +2014,20 @@ jobs:
                       continue
                   if p not in best or lvl > cand[best[p]][2]:
                       best[p] = a
+              # (1.24) a stop in just its country's own border, where that country has council areas: an
+              # island off one (Herm, off Guernsey) or a pier out from one. The nearest, within about 10 km
+              local_c = {country[p] for p, a in best.items() if cand[a][2] >= 5}
+              far = [p for p, a in best.items() if cand[a][2] < 5 and country[p] in local_c]
+              if far:
+                  sub = [k for k, a in enumerate(cand) if a[2] >= 5]
+                  stree = STRtree([cand[k][4] for k in sub])
+                  near = stree.query_nearest(pts[far], max_distance=0.1, return_distance=False)
+                  moved = 0
+                  for k, a in zip(near[0].tolist(), near[1].tolist()):
+                      if cand[sub[a]][2] <= PLACE_MAX_LEVEL.get(country[far[k]], 8):
+                          best[far[k]] = sub[a]
+                          moved += 1
+                  log('stops in just a country\'s border, put in the nearest council area:', moved, 'of', len(far))
               place_of = {}
               used = defaultdict(int)
               by_country = defaultdict(Counter)
@@ -1741,6 +2055,33 @@ jobs:
                           place_of[ids[i]] = 'a' + str(cand[a][0])
                           used[a] += 1
                           by_country[a][country[i]] += 1
+              # (an airport's place, if it has no stops)
+              if extra:
+                  ep = shapely.points([e[0] for e in extra], [e[1] for e in extra])
+                  ecountry = [default] * len(extra)
+                  if lands:
+                      elvl = [-1] * len(extra)
+                      pi2, ai2 = STRtree([a[4] for a in lands]).query(ep, predicate='within')
+                      for q, a in zip(pi2.tolist(), ai2.tolist()):
+                          if lands[a][2] > elvl[q]:
+                              elvl[q] = lands[a][2]
+                              ecountry[q] = lands[a][1]
+                  pi2, ai2 = tree.query(ep, predicate='within')
+                  ebest = {}
+                  for q, a in zip(pi2.tolist(), ai2.tolist()):
+                      lvl = cand[a][2]
+                      if lvl > PLACE_MAX_LEVEL.get(ecountry[q], 8):
+                          continue
+                      if q not in ebest or lvl > cand[ebest[q]][2]:
+                          ebest[q] = a
+                  for q, a in ebest.items():
+                      # (a whole country's own border, with council areas in it, isn't one)
+                      if cand[a][2] < 5 and any(cand[b][2] >= 5 for b in tree.query(cand[a][4], predicate='intersects').tolist() if b != a):
+                          continue
+                      if a not in used:
+                          used[a] += 0
+                          by_country[a][ecountry[q]] += 1
+                          log('  a place for its airport:', cand[a][1])
               out = []
               for a, n in used.items():
                   aid, name, lvl, pop, g = cand[a]
@@ -2218,8 +2559,23 @@ jobs:
               ap.add_argument('--poly', default='')
               ap.add_argument('--keep-filtered', action='store_true')
               a = ap.parse_args()
+              global LOOSE_SIGHTS
+              LOOSE_SIGHTS = a.region in LOOSE_SIGHT_REGIONS
               out = os.path.join(a.out, a.region)
               os.makedirs(out, exist_ok=True)
+              # the edge of the extract: a stop outside it is on another region's map (a ferry's far end)
+              edge = None
+              if a.poly and os.path.exists(a.poly):
+                  try:
+                      edge = load_poly(a.poly)
+                      log('extract edge', a.poly, 'area', round(edge.area, 3) if edge is not None else None)
+                  except Exception as e:
+                      log('  could not read', a.poly, e)
+              if edge is not None:
+                  shapely.prepare(edge)
+
+              def is_home(lon, lat):
+                  return edge is None or bool(shapely.contains_xy(edge, lon, lat))
               filtered = os.path.join(a.out, a.region + '.filtered.pbf')
               filter_pbf(a.pbf, filtered)
               R = Reader()
@@ -2236,8 +2592,34 @@ jobs:
               roads.load(filtered)
               if not a.keep_filtered:
                   os.remove(filtered)
-              routes, aliases = pick_routes(build_routes(R, stops, stop_of, roads), stops)
+              built = build_routes(R, stops, stop_of, roads)
               del roads
+              # (1.24) ferries that are only a line, and ferry relations whose stops aren't on the map: their lines
+              ok_rel = {r['rid'] for r in built}
+              also = set()
+              for rid, rel in R.routes.items():
+                  t = rel['tags']
+                  if ROUTE_MODES.get(t.get('route')) != 'ferry' or rid in ok_rel:
+                      continue
+                  nm = (t.get('name', '') + ' ' + t.get('description', '')).lower()
+                  if any(w in nm for w in SKIP_WORDS) or t.get('disused') == 'yes' or t.get('state') in ('proposed', 'disused'):
+                      continue
+                  also |= {ref for typ, ref, role in rel['members'] if typ == 'w'}
+              built += ferry_routes(R, stops, stop_of, is_home, also)
+              # (a route with none of its stops on this region's map: it's the other region's)
+              ids = list(stops)
+              if edge is not None and ids:
+                  home = shapely.contains_xy(edge, np.array([stops[k]['lon'] for k in ids]), np.array([stops[k]['lat'] for k in ids]))
+                  for k, h in zip(ids, home.tolist()):
+                      stops[k]['home'] = bool(h)
+              else:
+                  for k in ids:
+                      stops[k]['home'] = True
+              n0 = len(built)
+              built = [r for r in built if any(stops[sid]['home'] for sid in r['stops'])]
+              if len(built) < n0:
+                  log('routes all on another region\'s map: left to it', n0 - len(built))
+              routes, aliases = pick_routes(built, stops)
               used = set()
               for r in routes:
                   for i, sid in enumerate(r['stops']):
@@ -2250,18 +2632,23 @@ jobs:
               for s in stops.values():
                   if s['station']:
                       s['modes'] |= STATION_BIT
-              log('stops with routes', len(stops))
-              if not stops:
+              # (the stops on this region's map: a ferry's far end on another region's isn't drawn here, or
+              # put in a place: the game finds its place on the other map)
+              home_stops = {k: v for k, v in stops.items() if v['home']}
+              log('stops with routes', len(stops), 'on this map', len(home_stops))
+              if not home_stops:
                   write_json(os.path.join(out, 'meta.json'), {'v': 1, 'region': a.region, 'name': a.name, 'empty': True})
                   return
-              places, place_of = build_places(R, stops, a.region)
+              # (airports on this map: each gets a place, and the map round it)
+              apts_here = [(lon, lat) for iata, nm, lon, lat in R.airports if re.fullmatch(r'[A-Z]{3}', iata or '') and is_home(lon, lat)]
+              places, place_of = build_places(R, home_stops, a.region, apts_here)
               pl_by = {p['id']: p for p in places}
               for sid, s in stops.items():
-                  s['place'] = place_of.get(sid, '')
+                  s['place'] = place_of.get(sid, '') if s['home'] else ''
                   if s['place']:
                       pl_by[s['place']]['stops'] += 1
               for r in routes:
-                  hp = stops[r['stops'][0]].get('place')
+                  hp = next((stops[sid]['place'] for sid in r['stops'] if stops[sid].get('place')), None)
                   if hp:
                       pl_by[hp]['routes'] += 1
 
@@ -2316,7 +2703,7 @@ jobs:
 
               # towns you can start in (with at least 3 routes within 2 km)
               grid = defaultdict(list)
-              for s in stops.values():
+              for s in home_stops.values():
                   grid[(int(s['lon'] / 0.02), int(s['lat'] / 0.02))].append(s)
               tdoc = []
               for name, lon, lat, kind, pop in R.towns:
@@ -2337,25 +2724,18 @@ jobs:
 
               # detail tiles: every tile with stops, and the ones around them
               by_tile = defaultdict(list)
-              for s in stops.values():
+              for s in home_stops.values():
                   by_tile[tile_of(s['lon'], s['lat'], TZ)].append(s)
               want = set()
-              for (x, y) in by_tile:
+              for (x, y) in list(by_tile) + [tile_of(lon, lat, TZ) for lon, lat in apts_here]:
                   for dx in (-1, 0, 1):
                       for dy in (-1, 0, 1):
                           want.add((x + dx, y + dy))
-              lon_min = min(s['lon'] for s in stops.values()) - 0.1
-              lon_max = max(s['lon'] for s in stops.values()) + 0.1
-              lat_min = min(s['lat'] for s in stops.values()) - 0.1
-              lat_max = max(s['lat'] for s in stops.values()) + 0.1
+              lons = [s['lon'] for s in home_stops.values()] + [lon for lon, lat in apts_here]
+              lats = [s['lat'] for s in home_stops.values()] + [lat for lon, lat in apts_here]
+              lon_min, lon_max = min(lons) - 0.1, max(lons) + 0.1
+              lat_min, lat_max = min(lats) - 0.1, max(lats) + 0.1
               sea = load_sea(a.sea, (lon_min, lat_min, lon_max, lat_max)) if a.sea else []
-              edge = None
-              if a.poly and os.path.exists(a.poly):
-                  try:
-                      edge = load_poly(a.poly)
-                      log('extract edge', a.poly, 'area', round(edge.area, 3) if edge is not None else None)
-                  except Exception as e:
-                      log('  could not read', a.poly, e)
               coast = Sea(R.coast, edge) if not sea else Sea([])
               water = R.areas['w'] + sea
               bw, bg, bs = bucket(water, TZ), bucket(R.areas['g'], TZ), bucket(R.areas['s'], TZ)
@@ -2481,7 +2861,7 @@ jobs:
               ox0, oy1 = tile_of(lon_min, lat_min, OZ)
               ox1, oy0 = tile_of(lon_max, lat_max, OZ)
               oall = {(x, y) for x in range(ox0, ox1 + 1) for y in range(oy0, oy1 + 1)}
-              for (x, y) in sorted(oall | set(tile_of(s['lon'], s['lat'], OZ) for s in stops.values())):
+              for (x, y) in sorted(oall | set(tile_of(s['lon'], s['lat'], OZ) for s in home_stops.values())):
                   try:
                       doc = {'v': 2, 'x': x, 'y': y, 'z': OZ,
                              'w': budget_tris(layer_shape(ow.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, OZ))), x, y, OZ, 2.0, 40), 2.5, 60, 700),
@@ -2499,7 +2879,7 @@ jobs:
               write_json(os.path.join(out, 'meta.json'), {
                   'v': 2, 'region': a.region, 'name': a.name or a.region, 'built': time.strftime('%Y-%m-%d'), 'bbox': bb,
                   'tz': TZ, 'oz': OZ, 'ext': EXT, 't': tiles, 'o': otiles,
-                  'counts': {'routes': len(routes), 'stops': len(stops), 'places': len(places), 'towns': len(tdoc),
+                  'counts': {'routes': len(routes), 'stops': len(home_stops), 'places': len(places), 'towns': len(tdoc),
                              'modes': dict(Counter(r['mode'] for r in routes))}})
               log('done', a.region)
 
