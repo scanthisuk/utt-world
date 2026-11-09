@@ -126,7 +126,7 @@ jobs:
           import osmium
           import shapely
           import shapely.ops
-          from shapely.geometry import LineString, Polygon, box
+          from shapely.geometry import LineString, Point, Polygon, box
           from shapely.strtree import STRtree
 
           T0 = time.time()
@@ -290,7 +290,7 @@ jobs:
               ('public_transport', 'stop_position'), ('public_transport', 'platform'), ('public_transport', 'station'),
               ('highway', 'bus_stop'), ('railway', 'station'), ('railway', 'halt'), ('railway', 'tram_stop'), ('railway', 'stop'),
               ('railway', 'platform'), ('amenity', 'ferry_terminal'), ('amenity', 'bus_station'),
-              ('place', 'city'), ('place', 'town'), ('place', 'village'),
+              ('place', 'city'), ('place', 'town'), ('place', 'village'), ('place', 'hamlet'), ('place', 'island'), ('place', 'islet'),
               ('natural', 'water'), ('waterway', 'riverbank'), ('waterway', 'river'), ('waterway', 'canal'), ('waterway', 'dock'),
               ('landuse', 'reservoir'), ('landuse', 'basin'),
               ('leisure', 'park'), ('leisure', 'garden'), ('leisure', 'nature_reserve'), ('leisure', 'golf_course'),
@@ -356,6 +356,7 @@ jobs:
           def sight_rank(t, kind):
               return SIGHT_RANK.get(kind, 9) * 2 + (0 if t.get('wikipedia') else 1) + (0 if t.get('wikidata') else 40)
           PLACE_NODE = {'city', 'town', 'village'}
+          MINOR_PLACES = {'hamlet', 'island', 'islet'}
 
 
           def keep_filtered(o):
@@ -377,8 +378,12 @@ jobs:
               if o.is_node():
                   if t.get('place') in PLACE_NODE or is_stopish(t) or sight_kind(t) or (t.get('aeroway') == 'aerodrome' and t.get('iata')):
                       return True
-                  return False
-              # ways: everything matched (roads, rail, water, green, platforms)
+                  # (1.24: what ferries' stops are named after)
+                  return t.get('place') in MINOR_PLACES and bool(t.get('name'))
+              # ways: everything matched (roads, rail, water, green, platforms); (1.24) and islands drawn as an outline,
+              # just for their names (they're left out of the coast, as before)
+              if t.get('place') in ('island', 'islet'):
+                  return bool(t.get('name')) and t.get('boundary') is None
               return t.get('place') is None and t.get('boundary') is None
 
 
@@ -433,6 +438,8 @@ jobs:
                   self.way_geom = {}        # way id -> np.array (n, 2) lon/lat
                   self.way_tags = {}        # platform ways -> tags
                   self.towns = []           # (name, lon, lat, place, population)
+                  self.minor_places = []    # (1.24: naming ferries' stops) hamlets, islands: (name, lon, lat, place)
+                  self.island_shapes = []   # islands drawn as an outline: (name, polygon, place)
                   self.areas = {'w': [], 'g': [], 's': []}
                   self.lines = []           # (class, shapely LineString lon/lat)
                   self.admin = []           # (id, name, level, population, polygon)
@@ -484,6 +491,8 @@ jobs:
                                   pop = int(re.sub(r'[^0-9]', '', pop) or 0) if len(pop) < 12 else 0
                                   self.towns.append((t.get('name'), o.location.lon, o.location.lat, pl, pop))
                               continue
+                          if pl in MINOR_PLACES and t.get('name'):
+                              self.minor_places.append((t.get('name'), o.location.lon, o.location.lat, pl))
                           sk = sight_kind(t)
                           if sk:
                               self.sights.append((t.get('name:en') or t.get('name'), o.location.lon, o.location.lat, sk, 'n' + str(o.id),
@@ -502,6 +511,19 @@ jobs:
                               except Exception:
                                   pass
                           hw, rw, ww = t.get('highway'), t.get('railway'), t.get('waterway')
+                          if t.get('place') in ('island', 'islet') and t.get('name') and o.is_closed():
+                              try:
+                                  c = [(n.location.lon, n.location.lat) for n in o.nodes]
+                                  if len(c) >= 4:
+                                      g = Polygon(c)
+                                      if not g.is_valid:
+                                          g = g.buffer(0)
+                                      if not g.is_empty:
+                                          self.island_shapes.append((t.get('name'), g, t.get('place')))
+                              except Exception:
+                                  pass
+                          if t.get('place') is not None:
+                              continue
                           if t.get('natural') == 'coastline':
                               try:
                                   c = shapely.get_coordinates(shapely.from_wkb(wkb.create_linestring(o)))
@@ -539,6 +561,9 @@ jobs:
                                       self.lines.append((cls, g))
                       elif o.is_area():
                           t = o.tags
+                          # (an island drawn as an outline: just its name, above)
+                          if o.from_way() and t.get('place') is not None:
+                              continue
                           if t.get('boundary') == 'administrative' and not o.from_way():
                               try:
                                   lvl = int(t.get('admin_level', '99'))
@@ -580,6 +605,7 @@ jobs:
                               continue
                           self.areas[k].append(g)
                   log('nodes', len(self.nodes), 'route ways', len(self.way_geom), 'towns', len(self.towns),
+                      'hamlets and islands', len(self.minor_places), 'islands drawn', len(self.island_shapes),
                       'water', len(self.areas['w']), 'green', len(self.areas['g']), 'lines', len(self.lines), 'admin', len(self.admin),
                       'sights', len(self.sights), 'airports', len(self.airports), 'coastline ways', len(self.coast),
                       'ferry lines', len(self.ferry_ways))
@@ -1627,23 +1653,38 @@ jobs:
           # Islands' all are): a route each. Their ids: r(this + the line's first way's id)
           FERRY_ID_BASE = 10 ** 11
           FERRY_SKIP_WORDS = ('freight',)
+          # (other ferries that are really the same one, folded into it: { route id: the one kept })
+          FERRY_ALIASES = {}
+          FERRY_DEBUG = set()
 
 
           def ferryish(t):
               return t.get('amenity') == 'ferry_terminal' or t.get('ferry') == 'yes'
 
 
-          def split_ends(nm):
-              """'Douglas - Heysham' -> ['Douglas', 'Heysham'] (and 'A to B', 'A <> B', 'Operator: A - B',
-              'Poole (UK) - Jersey')"""
+          def name_words(n):
+              """a name's words, lower case: letters only (Ùige, Inis Meáin too), two or more of them"""
+              return {w for w in re.findall(r"[^\W\d_]+", (n or '').lower()) if len(w) > 1}
+
+
+          def split_parts(nm):
+              """the places in a ferry's name, in order: 'Douglas - Heysham', 'Oban - Coll - Tiree', 'Penarth to
+              Flat Holm', 'Operator: A - B', 'Poole (UK) - Jersey', 'Stromness-Scrabster'. [] if it isn't a list"""
               nm = re.sub(r'^[^:]{2,40}:\s*', '', nm or '')
               nm = re.sub(r'\s*\([^)]*\)', ' ', nm).strip()
-              # (a dash with spaces round it first: Hamble-le-Rice - Warsash; then one without: Stromness-Scrabster)
-              for pat in (r'\s*(?:<=>|<>|=>|->|→|↔| - | – | — | to )\s*', r'\s*-\s*'):
-                  parts = [clean_name(x) for x in re.split(pat, nm, flags=re.I) if x and x.strip()]
-                  if len(parts) == 2:
-                      return parts
-              return []
+              # (a dash with spaces round it first: Hamble-le-Rice - Warsash, An t-Òb - Borgh; then one without,
+              # just two places: Stromness-Scrabster)
+              parts = [x for x in re.split(r'\s*(?:<=>|<>|=>|->|→|↔)\s*|\s+[-–—]\s+|\s+to\s+', nm, flags=re.I) if x and x.strip()]
+              if len(parts) >= 2:
+                  return [clean_name(x) for x in parts]
+              parts = [x for x in re.split(r'\s*[-–—]\s*', nm) if x and x.strip()]
+              return [clean_name(x) for x in parts] if len(parts) == 2 else []
+
+
+          def split_ends(nm):
+              """(the old way: just two places)"""
+              p = split_parts(nm)
+              return p if len(p) == 2 else []
 
 
           FERRY_COMMON = {'ferry', 'ferries', 'terminal', 'port', 'harbour', 'harbor', 'pier', 'the', 'of', 'sea', 'quay', 'dock', 'docks',
@@ -1652,54 +1693,267 @@ jobs:
                           'upper', 'lower', 'bay', 'uk', 'f'}
           FERRY_WORDS = r'\b(?:ferry|ferries|route|shuttle|service|services|boat|boats|tours?|trips?|crossing|car|passenger|seasonal|' \
                         r'cruises?|water ?bus|launch|mail)\b'
+          # words in a ferry stop's name that don't say where it is: Ro-Ro 2, Foot Ferry, Steps 4, Berth 2, Ferry
+          # terminal, The Quay (higher tides), Water Taxi, Críochfort 3, CalMac ferry terminal, the operator's name
+          STOP_FILLER = FERRY_COMMON | {
+              'foot', 'water', 'taxi', 'taxis', 'steps', 'step', 'stairs', 'ro', 'ramp', 'berth', 'berths', 'linkspan', 'pontoon',
+              'pontoons', 'slip', 'slips', 'terminals', 'point', 'departure', 'departures', 'arrivals', 'embarkation', 'pickup', 'pick',
+              'up', 'drop', 'off', 'stop', 'stops', 'high', 'low', 'half', 'tide', 'tides', 'very', 'extreme', 'higher', 'private',
+              'public', 'national', 'trust', 'co', 'company', 'ltd', 'limited', 'com', 'www', 'org', 'net', 'ie', 'place', 'mooring',
+              'moorings', 'marina', 'calmac', 'boarding', 'gangway', 'wharf', 'waiting', 'room', 'shelter', 'office', 'ticket',
+              'tickets', 'booking', 'check', 'in', 'vehicle', 'vehicles', 'cars', 'car', 'passenger', 'passengers', 'main', 'inner',
+              'outer', 'end', 'an', 'for', 'to', 'at', 'from', 'with', 'by', 'via', 'línea', 'críochfort', 'cé', 'caladh', 'cei',
+              'glanfa', 'cidhe', 'line', 'lines', 'steamer', 'steamers', 'launch', 'cruise', 'cruises', 'tours', 'tour', 'trips',
+              'trip', 'boats', 'boat', 'service', 'services', 'shuttle', 'crossing', 'bus', 'waterbus', 'clipper', 'clippers',
+              'experience', 'seasonal', 'summer', 'winter', 'only', 'route', 'routes', 'mail', 'ro', 'roro', 'lo', 'yacht', 'yachts',
+              'tender', 'landing', 'gate', 'ramp', 'pickup', 'hire'} - {'higher'}
+          # words that say a stop is named after a ferry, not where it is: Isles of Scilly ferry (at Penzance),
+          # Torpoint Ferry (at Devonport), Pentland Ferries, Jura Passenger Ferry (at Tayvallich)
+          SERVICE_WORDS = {'ferry', 'ferries', 'shuttle', 'service', 'services', 'cruise', 'cruises', 'boat', 'boats', 'taxi', 'launch',
+                           'tours', 'tour', 'trips', 'trip', 'crossing', 'steamers', 'mail', 'waterbus', 'clippers', 'experience'}
+          # (words in a ferry's name that aren't a place: Coniston Launch - Northern Service)
+          PART_FILLER = {'northern', 'southern', 'eastern', 'western', 'circular', 'round', 'evening', 'morning', 'express', 'fast',
+                         'direct', 'local', 'sightseeing', 'scenic', 'heritage', 'historic', 'wildlife', 'seal', 'seals', 'puffin',
+                         'puffins', 'dolphin', 'dolphins', 'whale', 'whales', 'nature', 'trail', 'park', 'ride', 'float', 'pleasure',
+                         'green', 'red', 'blue', 'yellow', 'orange', 'purple', 'river', 'canal', 'lake', 'loch', 'lough'}
+          # (words that make a name a place: an island, a castle on one)
+          PLACE_WORDS = {'island', 'isle', 'islands', 'inis', 'inish', 'ynys', 'eilean', 'holm', 'rock', 'castle', 'abbey', 'priory',
+                         'mount', 'head', 'cape', 'lighthouse', 'fort', 'skerries', 'beg', 'mor', 'mòr', 'mór', 'ness', 'oileán'}
 
 
           def town_words(n):
-              return set(re.findall(r'[a-z]+', (n or '').lower())) - FERRY_COMMON
+              return name_words(n) - FERRY_COMMON
 
 
           def same_town(a, b):
               return bool(town_words(a) & town_words(b))
 
 
+          def clashes(a, b):
+              """two stop names too alike for a ferry's two ends: Burnham and Burnham-on-Crouch (not Skomer Island and
+              Embarkation Point for Skomer and Skokholm Islands, or Dalkey and Dalkey Island)"""
+              isle = {'isle', 'island', 'islands'}
+              wa, wb = town_words(a), town_words(b)
+              if not wa or not wb or bool(name_words(a) & isle) != bool(name_words(b) & isle):
+                  return False
+              return (wa <= wb and len(wb - wa) <= 1) or (wb <= wa and len(wa - wb) <= 1)
+
+
+          def clean_part(p):
+              """a place in a ferry's name, as a stop's name: Mevagissey Ferry -> Mevagissey, Gills Bay Ferry Terminal ->
+              Gills Bay, Inishturk Mail Boat -> Inishturk, Tresco very low tide route -> Tresco. '' if it isn't a place"""
+              p = re.sub(r'\([^)]*\)', ' ', p or '')
+              p = p.split(',')[0]
+              p = re.sub(r'\b(?:very\s+|extreme\s+)?(?:low|high|half|higher|lower)\s+(?:tides?|water)\b', ' ', p, flags=re.I)
+              p = re.sub(FERRY_WORDS, ' ', p, flags=re.I)
+              p = re.sub(r'\b(?:terminal|route|only|summer|winter|stop|foot|water\s+taxi|taxi|pleasure|tender|experience)\b', ' ', p, flags=re.I)
+              p = clean_name(re.sub(r'\s+', ' ', p).strip(' -:,/&'))
+              if not (name_words(p) - STOP_FILLER - PART_FILLER):
+                  return ''
+              return p
+
+
+          def stop_name_ok(nm, op_words=frozenset()):
+              """a ferry stop's name that says where it is (not a berth's number, a web address, Ferry terminal, the
+              operator's name: Pentland Ferries, though King Harry's the place the King Harry ferry company's named after)"""
+              if not nm or re.search(r'\d', nm) or re.search(r'www\.|\.(?:com|ie|co\.uk|org|net)\b', nm, re.I):
+                  return False
+              w = name_words(re.sub(r'\([^)]*\)', ' ', nm))
+              return bool(w - STOP_FILLER - (set(op_words) if w & SERVICE_WORDS else set()))
+
+
+          def generic_route_name(nm):
+              """a ferry's name that says nothing: Seasonal (Doolin2Aran), Water Taxi, Waterbus, Island Ferry"""
+              return not (name_words(re.sub(r'\([^)]*\)', ' ', nm or '')) - STOP_FILLER)
+
+
           class FerryNames:
-              """naming a ferry's stops: the towns of this region's map, and which names are this region's own"""
+              """naming a ferry's stops: the towns, villages, hamlets and islands of this region's map, its sights,
+              and which names are this region's own"""
 
               def __init__(self, R, stops, region_name):
                   self.stops = stops
-                  self.tgrid = defaultdict(list)
+                  self.grid = defaultdict(list)   # (name, lon, lat, kind) of towns, villages, hamlets, islands
                   for tw in R.towns:
-                      self.tgrid[(int(tw[1] / 0.1), int(tw[2] / 0.1))].append(tw)
+                      self.grid[(int(tw[1] / 0.1), int(tw[2] / 0.1))].append((tw[0], tw[1], tw[2], tw[3]))
+                  for nm, lon, lat, kind in getattr(R, 'minor_places', ()):
+                      self.grid[(int(lon / 0.1), int(lat / 0.1))].append((nm, lon, lat, kind))
+                  # (sights out of town a ferry goes to: castles, abbeys, nature reserves. Not a museum by a pier in town)
+                  self.sgrid = defaultdict(list)
+                  for sg in getattr(R, 'sights', ()) or ():
+                      if sg[0] and sg[3] in ('castle', 'historic', 'church', 'park'):
+                          self.sgrid[(int(sg[1] / 0.1), int(sg[2] / 0.1))].append((sg[0], sg[1], sg[2], sg[3]))
+                  # (islands drawn as an outline: which one a stop's on, or by)
+                  try:
+                      isl = [(nm, g, kind) for nm, g, kind in getattr(R, 'island_shapes', ()) if g is not None and not g.is_empty]
+                      self.isl_tree = STRtree([g for nm, g, kind in isl]) if isl else None
+                  except Exception as e:
+                      log('  islands left out of naming ferries\' stops:', repr(e))
+                      isl, self.isl_tree = [], None
+                  self.isl_names = [nm for nm, g, kind in isl]
+                  self.isl_kinds = [kind for nm, g, kind in isl]
+                  self.isl_geoms = [g for nm, g, kind in isl]
                   self.region_words = town_words(region_name)
-                  self.town_sets = [w for w in (town_words(tw[0]) for tw in R.towns) if w]
+                  # (whole names, for 'is this one of ours': Jersey isn't, though Jersey Marine is)
+                  self.place_keys = {frozenset(town_words(tw[0])) for tw in R.towns if town_words(tw[0])} | \
+                      {frozenset(town_words(p[0])) for p in getattr(R, 'minor_places', ()) if town_words(p[0])} | \
+                      {frozenset(town_words(nm)) for nm in self.isl_names if town_words(nm)}
+                  self.island_keys = {frozenset(town_words(p[0])) for p in getattr(R, 'minor_places', ())
+                                      if p[3] in ('island', 'islet') and town_words(p[0])} | \
+                      {frozenset(town_words(nm)) for nm in self.isl_names if town_words(nm)}
 
-              def nearest_town(self, lon, lat, km):
-                  best, bd = None, km
+              def _near(self, grid, lon, lat, km):
                   gx, gy = int(lon / 0.1), int(lat / 0.1)
-                  for dx in (-1, 0, 1):
-                      for dy in (-1, 0, 1):
-                          for nm, tlon, tlat, kind, pop in self.tgrid.get((gx + dx, gy + dy), ()):
-                              d = hav_km((lon, lat), (tlon, tlat)) * (1.5 if kind == 'village' else 1.0)
-                              if d < bd:
-                                  best, bd = nm, d
+                  r = 1 if km <= 7 else 2
+                  for dx in range(-r, r + 1):
+                      for dy in range(-r, r + 1):
+                          for p in grid.get((gx + dx, gy + dy), ()):
+                              d = hav_km((lon, lat), (p[1], p[2]))
+                              if d <= km:
+                                  yield d, p
+
+              @staticmethod
+              def _this_side(st, pt, others):
+                  """is pt on this stop's side, not the others': no nearer one of them (by more than a bit: a town
+                  between two ends of a crossing is either's)"""
+                  d = hav_km((st['lon'], st['lat']), pt)
+                  return all(d <= 1.25 * hav_km((o['lon'], o['lat']), pt) + 0.2 for o in others)
+
+              def nearest(self, st, km, kinds, others=(), not_names=()):
+                  """the nearest town (of these kinds) within km, on this stop's side ('village' and 'hamlet' count as
+                  half as near again: a town's name beats a village's next to it)"""
+                  best, bd = None, None
+                  for d, (nm, lon, lat, kind) in self._near(self.grid, st['lon'], st['lat'], km):
+                      if kind not in kinds or any(clashes(nm, x) for x in not_names if x):
+                          continue
+                      if others and not self._this_side(st, (lon, lat), others):
+                          continue
+                      w = d * (1.5 if kind in ('village', 'hamlet') else 1.0)
+                      if bd is None or w < bd:
+                          best, bd = nm, w
                   return best
 
-              def town_there(self, st, part, km=5.0):
-                  """how far the stop is from a town called this (None: none within km)"""
-                  best = None
-                  gx, gy = int(st['lon'] / 0.1), int(st['lat'] / 0.1)
-                  for dx in (-1, 0, 1):
-                      for dy in (-1, 0, 1):
-                          for nm, tlon, tlat, kind, pop in self.tgrid.get((gx + dx, gy + dy), ()):
-                              d = hav_km((st['lon'], st['lat']), (tlon, tlat))
-                              if d < km and same_town(nm, part) and (best is None or d < best):
-                                  best = d
+              def sight_at(self, st, km, others=(), not_names=()):
+                  best, bd = None, None
+                  for d, (nm, lon, lat, kind) in self._near(self.sgrid, st['lon'], st['lat'], km):
+                      if any(clashes(nm, x) for x in not_names if x):
+                          continue
+                      if others and not self._this_side(st, (lon, lat), others):
+                          continue
+                      if bd is None or d < bd:
+                          best, bd = nm, d
                   return best
+
+              def island_at(self, st, km, others=(), not_names=(), small=False):
+                  """the island (drawn as an outline) the stop's on or right by, that none of the others are (not an
+                  islet: a rock by a pier). small: one of no more than about 10 square km (Dalkey Island, Spike Island:
+                  its name beats the town over the water's)"""
+                  if self.isl_tree is None:
+                      return None
+                  p = Point(st['lon'], st['lat'])
+                  deg = km / 70.0
+                  best, bd = None, None
+                  for k in self.isl_tree.query(p.buffer(deg)).tolist():
+                      if self.isl_kinds[k] != 'island' or any(clashes(self.isl_names[k], x) for x in not_names if x):
+                          continue
+                      g = self.isl_geoms[k]
+                      if small and g.area > 0.002:
+                          continue
+                      d = g.distance(p)
+                      if d > deg or any(g.distance(Point(o['lon'], o['lat'])) <= deg for o in others):
+                          continue
+                      # (the smallest one it's on: an island off an island)
+                      if bd is None or (d, g.area) < bd:
+                          best, bd = self.isl_names[k], (d, g.area)
+                  return best
+
+              def place_dist(self, st, part, km, others=()):
+                  """how far the stop is from a town, village, hamlet or island with a name like this (one in a
+                  ferry's name), on this stop's side (None: none within km). A name that's only partly the same
+                  counts as further off: Westray's not Papa Westray"""
+                  w = town_words(part)
+                  if not w:
+                      return None
+
+                  def cost(d, nm):
+                      pw = town_words(nm)
+                      return d + 3.0 * (1.0 - len(pw & w) / len(pw | w))
+                  best = None
+                  for d, (nm, lon, lat, kind) in self._near(self.grid, st['lon'], st['lat'], km):
+                      if (town_words(nm) & w) and (not others or self._this_side(st, (lon, lat), others)):
+                          c = cost(d, nm)
+                          if best is None or c < best:
+                              best = c
+                  if self.isl_tree is not None:
+                      p = Point(st['lon'], st['lat'])
+                      for k in self.isl_tree.query(p.buffer(km / 70.0)).tolist():
+                          if not (town_words(self.isl_names[k]) & w):
+                              continue
+                          g = self.isl_geoms[k]
+                          d = g.distance(p) * 70.0
+                          if d <= km and all(d <= 1.25 * g.distance(Point(o['lon'], o['lat'])) * 70.0 + 0.2 for o in others):
+                              c = cost(d, self.isl_names[k])
+                              if best is None or c < best:
+                                  best = c
+                  return best
+
+              def named_elsewhere(self, st, words, others):
+                  """a name (its words) that's a place on another of the route's stops' side and none on this one's:
+                  Torpoint Ferry, at Devonport; Valentia Island Car Ferry, at Reenard"""
+                  here = there = False
+                  for d, (nm, lon, lat, kind) in self._near(self.grid, st['lon'], st['lat'], 6.0):
+                      if town_words(nm) & words:
+                          if self._this_side(st, (lon, lat), others):
+                              here = True
+                          else:
+                              there = True
+                  if self.isl_tree is not None:
+                      p = Point(st['lon'], st['lat'])
+                      for k in self.isl_tree.query(p.buffer(6.0 / 70.0)).tolist():
+                          if town_words(self.isl_names[k]) & words:
+                              g = self.isl_geoms[k]
+                              d = g.distance(p)
+                              if any(g.distance(Point(o['lon'], o['lat'])) < d * 0.5 for o in others):
+                                  there = True
+                              else:
+                                  here = True
+                  return there and not here
 
               def ours(self, part):
-                  """a town in a ferry's name that's this region's: its own name (Isle of Man), or one of its towns"""
+                  """a town in a ferry's name that's this region's: its own name (Isle of Man), or one of its places"""
                   w = town_words(part)
-                  return bool(w) and (w <= self.region_words or any(w <= t for t in self.town_sets))
+                  return bool(w) and (w <= self.region_words or frozenset(w) in self.place_keys)
+
+              def island_like(self, nm):
+                  """a name that's an island's (Westray, Guernsey, the Isle of Man), not a town's"""
+                  w = town_words(nm)
+                  return bool(w) and (bool(name_words(nm) & {'island', 'isle', 'islands', 'inis', 'inish', 'ynys', 'eilean', 'oileán'}) or
+                                      frozenset(w) in self.island_keys or w <= self.region_words)
+
+              def place_like(self, nm):
+                  """a name that's a place: one on the map, or an island or a castle by its name"""
+                  w = town_words(nm)
+                  return bool(w) and (bool(name_words(nm) & PLACE_WORDS) or frozenset(w) in self.place_keys)
+
+              def near_name(self, st, others, not_names=()):
+                  """the place a ferry stop's at, if it's at one: the town it's in, the island it's on, the hamlet"""
+                  return (self.nearest(st, 1.5, ('city', 'town', 'village'), others, not_names) or
+                          self.island_at(st, 0.15, others, not_names) or
+                          self.nearest(st, 1.0, ('hamlet',), others, not_names) or
+                          self.nearest(st, 3.0, ('city', 'town', 'village'), others, not_names))
+
+              def name_for(self, st, others, isl='', not_names=()):
+                  """a name for a ferry stop with none: the town it's in, the island it's on, the hamlet, else the
+                  sight there (St Michael's Mount, Loch Leven Castle), the place the ferry's named after (Mount
+                  Batten), the nearest town or hamlet"""
+                  return (self.island_at(st, 0.15, others, not_names, small=True) or
+                          self.nearest(st, 1.5, ('city', 'town', 'village'), others, not_names) or
+                          self.island_at(st, 0.15, others, not_names) or
+                          self.nearest(st, 1.0, ('hamlet',), others, not_names) or
+                          self.sight_at(st, 0.4, others, not_names) or
+                          (isl if isl and self.place_like(isl) and not any(clashes(isl, x) for x in not_names if x) else None) or
+                          self.nearest(st, 5.0, ('city', 'town', 'village'), others, not_names) or
+                          self.nearest(st, 3.0, ('hamlet',), others, not_names))
 
 
           def ferry_routes(R, stops, stop_of, is_home, also_ways, region_name=''):
@@ -1770,7 +2024,6 @@ jobs:
                           adj[j].append((n, i))
               out = []
               done = set()
-              named_here = set()   # (stops this names: ones it can name again, never a terminal's own name)
               for i in sorted(range(len(pool)), key=lambda k: pool[k][0]):
                   if i in done:
                       continue
@@ -1786,8 +2039,11 @@ jobs:
                   start = min(tips or comp, key=lambda k: pool[k][0])
                   wid, t, c, n0, n1 = pool[start]
                   jn = {n for n, j in adj[start]}
+                  # (which way its line was drawn: the first place in its name is where, mostly)
+                  fwd = True
                   if n0 in jn and n1 not in jn:
                       c, a_node, b_node = c[::-1], n1, n0
+                      fwd = False
                   else:
                       a_node, b_node = n0, n1
                   coords = [(float(p[0]), float(p[1])) for p in c]
@@ -1810,6 +2066,7 @@ jobs:
                   if b_node < a_node:
                       coords = coords[::-1]
                       a_node, b_node = b_node, a_node
+                      fwd = not fwd
                   wids = sorted(pool[k][0] for k in comp)
                   tags = next((pool[k][1] for k in sorted(comp, key=lambda k: pool[k][0]) if pool[k][1].get('name')), pool[start][1])
                   (a_lon, a_lat), (b_lon, b_lat) = coords[0], coords[-1]
@@ -1833,10 +2090,8 @@ jobs:
                               return sid
                       sid = 'n' + str(node)
                       if sid not in stops:
-                          # (named after the terminal there: an end with no name gets one below)
-                          k = nearest_stop(fgrid, lon, lat, 0.6) if home else None
-                          stops[sid] = {'id': sid, 'lon': lon, 'lat': lat, 'name': stops[k]['name'] if k else '', 'station': True,
-                                        'modes': 0, 'routes': []}
+                          # (no name yet: it's given one below, with every ferry's)
+                          stops[sid] = {'id': sid, 'lon': lon, 'lat': lat, 'name': '', 'station': True, 'modes': 0, 'routes': []}
                           fixed['stops made at its ends'] += 1
                       return sid
                   sa = end_stop(a_node, a_lon, a_lat, a_home)
@@ -1878,82 +2133,6 @@ jobs:
                   seq = tidy
                   if len(set(sid for sid, _ in seq)) < 2:
                       continue
-                  # names for its ends. One on this map with none: the town in the ferry's name that's
-                  # there (Knott End to Fleetwood), else the town it's in, else (an island off one: Herm)
-                  # the town in its name that isn't this region's, else the nearest. One on another
-                  # region's map: the town in the ferry's name (not its berth's name: Poole, not Ro-Ro 2):
-                  # the one the other end isn't, else the one that isn't this region's
-                  fr, to = tags.get('from'), tags.get('to')
-                  pairs = []
-                  if fr and to:
-                      pairs.append([clean_name(re.sub(r'\s*\([^)]*\)', ' ', x).strip()) for x in (fr, to)])
-                  np2 = split_ends(tags.get('name', ''))
-                  if np2 and np2 not in pairs:
-                      pairs.append(np2)
-                  first, last = stops[seq[0][0]], stops[seq[-1][0]]
-                  # (the place in a ferry's name that's one place: Sherkin Island Ferry, Skellig Michael Tours)
-                  isl = ''
-                  if tags.get('name') and not pairs:
-                      isl = re.sub(FERRY_WORDS, ' ', re.sub(r'\([^)]*\)', ' ', re.sub(r'^[^:]{2,40}:\s*', '', tags['name'])), flags=re.I)
-                      isl = clean_name(re.sub(r'\s+', ' ', isl).strip(' -:'))
-                  order = [(first, last, 0), (last, first, 1)]
-                  order.sort(key=lambda e: 0 if is_home(e[0]['lon'], e[0]['lat']) else 1)
-                  for this, other, mine in order:
-                      if is_home(this['lon'], this['lat']):
-                          if this['name']:
-                              continue
-                          nm = None
-                          for towns in pairs:
-                              there = [FN.town_there(this, x) for x in towns]
-                              if there[0] is not None or there[1] is not None:
-                                  nm = towns[0] if there[1] is None or (there[0] is not None and there[0] <= there[1]) else towns[1]
-                                  break
-                          nm = nm or FN.nearest_town(this['lon'], this['lat'], 2.0)
-                          if not nm:
-                              for towns in pairs:
-                                  cands = [x for x in towns if not FN.ours(x) and not (other['name'] and same_town(other['name'], x))]
-                                  if len(cands) == 1:
-                                      nm = cands[0]
-                                      break
-                          nm = nm or FN.nearest_town(this['lon'], this['lat'], 8.0)
-                          if nm:
-                              this['name'] = nm
-                              named_here.add(this['id'])
-                      else:
-                          nm = None
-                          for towns in pairs:
-                              if other['name'] and same_town(other['name'], towns[0]) and not same_town(other['name'], towns[1]):
-                                  nm = towns[1]
-                              elif other['name'] and same_town(other['name'], towns[1]) and not same_town(other['name'], towns[0]):
-                                  nm = towns[0]
-                              else:
-                                  cands = [x for x in towns if not FN.ours(x)]
-                                  nm = cands[0] if len(cands) == 1 else None
-                              if nm:
-                                  break
-                          if nm:
-                              this['name'] = nm
-                              named_here.add(this['id'])
-                      if not this['name'] and pairs:
-                          this['name'] = pairs[-1][mine]
-                          named_here.add(this['id'])
-                      if not this['name'] and isl and not same_town(isl, other['name']):
-                          this['name'] = isl
-                          named_here.add(this['id'])
-                  # (both ends named after one town: Sherkin Island Ferry, from Baltimore. The one further
-                  # from it is the island in the ferry's name)
-                  if name_key(first['name']) == name_key(last['name']):
-                      if isl and name_key(isl) != name_key(first['name']):
-                          da, db = FN.town_there(first, first['name'], 20.0), FN.town_there(last, last['name'], 20.0)
-                          far = first if (db is not None and (da is None or da > db)) else last
-                          if far['id'] in named_here:
-                              far['name'] = isl
-                  # (a terminal it calls at with no name: the town it's in)
-                  for sid, _ in seq:
-                      st = stops[sid]
-                      if not st['name']:
-                          st['name'] = FN.nearest_town(st['lon'], st['lat'], 8.0) or 'Ferry terminal'
-                          named_here.add(sid)
                   # the line between each stop and the next (about 20 m: a ferry's line is a smooth one)
                   km, enc = [0.0], [[]]
                   for i in range(1, len(seq)):
@@ -1971,36 +2150,397 @@ jobs:
                           px, py = qx, qy
                       enc.append(flat)
                   ref = (tags.get('ref') or '').strip()
-                  nm = clean_name(re.sub(r'^[^:]{2,40}:\s*', '', tags.get('name') or ''))
                   # (a bit of a ferry that goes on from a port on another region's map: named after its own ends)
                   goes_on = any(not is_home(*coords[k]) and len(ends.get(node, ())) > 1 for k, node in ((0, a_node), (-1, b_node)))
-                  name = f"{first['name']} - {last['name']}" if (goes_on or not nm) else nm
-                  col = colour_of(tags.get('colour')) or pick_colour('ferry:' + (ref or name))
+                  # (an end where other ferries' lines meet it, out in a harbour: a bit of one, maybe)
+                  joined = any(len(ends.get(node, ())) > 1 for node in (a_node, b_node))
                   rid = FERRY_ID_BASE + wids[0]
-                  out.append({'id': 'r' + str(rid), 'rid': rid, 'mode': 'ferry', 'ref': ref[:12], 'name': name[:60], 'col': col,
+                  out.append({'id': 'r' + str(rid), 'rid': rid, 'mode': 'ferry', 'ref': ref[:12], 'name': '', 'col': '',
                               'op': (tags.get('operator') or '')[:40], 'net': (tags.get('network') or '')[:40], 'master': None,
-                              'stops': [sid for sid, _ in seq], 'g': enc, 'km': km, 'total': sum(km)})
+                              'stops': [sid for sid, _ in seq], 'g': enc, 'km': km, 'total': sum(km),
+                              '_f': {'tags': tags, 'cross': cross, 'goes_on': goes_on, 'joined': joined, 'drawn_fwd': fwd}})
                   fixed['to another region' if cross else 'here'] += 1
+              # (the names of ferries that go abroad from here: a bit of one in a harbour here isn't one of ours)
+              foreign_names = {name_key(t.get('name')) for wid, t, c, n0, n1 in R.ferry_ways if t.get('name') and
+                               not (is_home(float(c[0][0]), float(c[0][1])) and is_home(float(c[-1][0]), float(c[-1][1])))}
+              try:
+                  out = name_ferries(out, stops, FN, is_home, fixed, foreign_names)
+              except Exception as e:
+                  log('ferries named plainly, naming them went wrong:', repr(e))
+                  out = plain_ferry_names(out, stops, FN, is_home)
               log('ferries that are only a line', len(out), 'from', len(pool), 'lines', dict(fixed))
               return out
 
 
+          def ferry_places(tags):
+              """the places in a ferry's name (from= and to=, else its name), each as a stop's name; whether each
+              was named as a ferry (Stuart Line Cruises, not a place); and the one place a ferry's named after if
+              it's just one (Sherkin Island Ferry, Skellig Michael Tours)"""
+              fr, to = tags.get('from'), tags.get('to')
+              raw = [fr, to] if fr and to else []
+              if len([p for p in raw if clean_part(p)]) < 2:
+                  raw = split_parts(tags.get('name', ''))
+              got = [(clean_part(x), bool(name_words(re.sub(r'\([^)]*\)', ' ', x)) & SERVICE_WORDS)) for x in raw]
+              got = [(p, svc) for p, svc in got if p]
+              isl = ''
+              if len(got) < 2:
+                  isl = got[0][0] if got else clean_part(re.sub(r'^[^:]{2,40}:\s*', '', tags.get('name') or ''))
+                  got = []
+              return [p for p, svc in got], [svc for p, svc in got], isl
+
+
+          def merge_out_stop(r, m, stops):
+              """take stop m (not an end) out of a route: the lines either side of it made one"""
+              seq = r['stops']
+              pa, pm = stops[seq[m - 1]], stops[seq[m]]
+              pts = []
+              for start, g in ((pa, r['g'][m]), (pm, r['g'][m + 1])):
+                  px, py = e5(start['lat']), e5(start['lon'])
+                  for k in range(0, len(g) - 1, 2):
+                      px += g[k]
+                      py += g[k + 1]
+                      pts.append((px, py))
+                  if start is pa:
+                      pts.append((e5(pm['lat']), e5(pm['lon'])))
+              flat, qx, qy = [], e5(pa['lat']), e5(pa['lon'])
+              for x, y in pts:
+                  flat += [x - qx, y - qy]
+                  qx, qy = x, y
+              r['g'] = r['g'][:m] + [flat] + r['g'][m + 2:]
+              r['km'] = r['km'][:m] + [round(r['km'][m] + r['km'][m + 1], 3)] + r['km'][m + 2:]
+              r['stops'] = seq[:m] + seq[m + 1:]
+              r['total'] = sum(r['km'])
+
+
+          def name_ferries(routes, stops, FN, is_home, fixed, foreign_names=frozenset()):
+              """(1.24) the names of the stops of ferries that are only a line, and the ferries'. A terminal keeps its
+              name if it says where it is (not Ro-Ro 2, Steps 4, Berth 2, Ferry terminal, Pentland Ferries, Isles
+              of Scilly ferry at Penzance, Torpoint Ferry at Devonport); the rest are named after the place in the
+              ferry's name that's there (by a town of that name, or else the one the other end isn't: Fishnish,
+              Westray, Isle of May), else the town or island or hamlet there, the sight (St Michael's Mount), the
+              nearest town. Then: bits of a ferry abroad out in its harbour here (Dover's, Tilbury's) go, a stop
+              between two of one town's is left out, and one that's another's other way round (or the other tide's)
+              is folded into it"""
+              named_by = {}
+              keep_routes = []
+              def one(r):
+                  info = r['_f']
+                  tags = info['tags']
+                  seq = [stops[s] for s in r['stops']]
+                  n = len(seq)
+                  ends_ = (0, n - 1)
+                  parts, svc, isl = ferry_places(tags)
+                  if not parts and not isl and not tags.get('name') and tags.get('operator'):
+                      # (one with no name: the place its operator's named after, if that's one: Inishbofin Ferry. Not
+                      # Caledonian MacBrayne)
+                      isl = clean_part(tags['operator'])
+                      if not FN.place_like(isl):
+                          isl = ''
+                  opw = name_words(tags.get('operator', '')) | name_words(tags.get('network', ''))
+                  rwords = name_words(re.sub(r'\([^)]*\)', ' ', tags.get('name', ''))) - STOP_FILLER
+                  home = [is_home(s['lon'], s['lat']) for s in seq]
+                  # a bit of a ferry abroad, out in its harbour here (Dover (UK) - Calais from one berth to the next,
+                  # Tilbury - Zeebrugge in the river), or a bit of one with no name where others meet. (First: its
+                  # ends are the ferry's own)
+                  if not info['cross'] and r['total'] < 5.0 and (name_key(tags.get('name')) in foreign_names or
+                                                                 (info['joined'] and not tags.get('name') and r['total'] < 1.5)):
+                      fixed['bits of a ferry out in a harbour, left out'] += 1
+                      return
+
+                  def others(i):
+                      # (a stop between: the others not in the same place as it, so the town it's in is still its own
+                      # though one of the ends is in it too: Aberdeen's Ro-Ro Ramp)
+                      if 0 < i < n - 1:
+                          return [seq[k] for k in range(n) if k != i and
+                                  hav_km((seq[k]['lon'], seq[k]['lat']), (seq[i]['lon'], seq[i]['lat'])) > 2.0]
+                      return [seq[k] for k in range(n) if k != i]
+
+                  def core(s):
+                      return name_words(re.sub(r'\([^)]*\)', ' ', s['name'])) - STOP_FILLER - opw
+
+                  # 1. the names it has that say where it is
+                  keep, own = [False] * n, [None] * n
+                  for i, s in enumerate(seq):
+                      if s['id'] in named_by:
+                          keep[i] = True
+                          continue
+                      if not home[i] or not stop_name_ok(s['name'], opw):
+                          continue
+                      keep[i] = True
+                      # (a ferry's name on its terminal: Fowey to Bodinnick Ferry, Glenelg-Skye Ferry. The place in it that's here)
+                      sp = [x for x in (clean_part(x) for x in split_parts(s['name'])) if x]
+                      if len(sp) >= 2:
+                          ds = [(FN.place_dist(s, x, 3.0, others(i)), x) for x in sp]
+                          ds = [(d, x) for d, x in ds if d is not None]
+                          if ds:
+                              own[i] = min(ds)[1]
+                              keep[i] = False
+                      # (named after the ferry it's for, not where it is: Mersey Ferries, Torpoint Ferry; Jura Passenger
+                      # Ferry, Pentland Ferries, Isles of Scilly ferry, on one named after where it goes)
+                      elif name_words(s['name']) & SERVICE_WORDS and core(s) and \
+                              ((rwords and core(s) <= rwords) or (parts and not any(core(s) & town_words(p) for p in parts))):
+                          keep[i] = False
+                  # 2. which stop each place in its name is at: the nearest to a place called that first; then an end
+                  # with none, the one at the other end of the list from the other end's
+                  assign = {}
+                  if parts:
+                      cands = []
+                      for i, s in enumerate(seq):
+                          if not home[i]:
+                              continue
+                          # (a name it keeps that has a place in the ferry's name in it: that one, the fullest)
+                          within = [j for j, p in enumerate(parts) if keep[i] and town_words(p) and town_words(p) <= town_words(s['name'])]
+                          mine = max(within, key=lambda j: len(town_words(parts[j]))) if within else None
+                          for j, p in enumerate(parts):
+                              d = FN.place_dist(s, p, 5.0, others(i))
+                              if j == mine:
+                                  d = 0.0
+                              if d is not None:
+                                  cands.append((d, i, j))
+                      used = set()
+                      for d, i, j in sorted(cands):
+                          if i in assign or j in used:
+                              continue
+                          assign[i] = j
+                          used.add(j)
+                      free = [i for i in ends_ if i not in assign]
+                      last = len(parts) - 1
+                      if len(free) == 1:
+                          i, k = free[0], n - 1 - free[0]
+                          if k in assign:
+                              jk = assign[k]
+                              j = last if jk == 0 else (0 if jk == last else None)
+                              # (one that's a place's name: not Stuart Line Cruises)
+                              if j is not None and j not in used and (not home[i] or not svc[j] or FN.place_like(parts[j])):
+                                  assign[i] = j
+                                  used.add(j)
+                      elif len(free) == 2 and len(parts) >= 2:
+                          if not all(home[i] for i in ends_):
+                              # (neither end by a place in its name, one on another region's map: that one's the
+                              # place that isn't ours, and isn't the other end's)
+                              fi = next(i for i in ends_ if not home[i])
+                              hi = n - 1 - fi
+                              hn = seq[hi]['name']
+                              c2 = [j for j, p in enumerate(parts) if not FN.ours(p) and not (hn and same_town(hn, p))]
+                              if len(c2) != 1:
+                                  c2 = [j for j, p in enumerate(parts) if not (hn and same_town(hn, p))]
+                              if c2:
+                                  # (more than one: the one at its end of the list, by which way its line was drawn)
+                                  by_dir = 0 if (fi == 0) == info['drawn_fwd'] else last
+                                  j = c2[0] if len(c2) == 1 or by_dir not in c2 else by_dir
+                                  assign[fi] = j
+                                  used.add(j)
+                                  if len(parts) == 2 and not keep[hi]:
+                                      assign[hi] = 1 - j
+                                      used.add(1 - j)
+                          elif len(parts) == 2:
+                              # (neither end by a place in its name: the map hasn't its villages. An end that isn't at
+                              # one either: the place in its name at its end of the list, by which way its line was drawn)
+                              for i in ends_:
+                                  if not keep[i] and not FN.near_name(seq[i], others(i)):
+                                      assign[i] = 0 if (i == 0) == info['drawn_fwd'] else 1
+                              used |= set(assign.values())
+                      # (the stops between, if each of its places has one: Oban - Coll - Tiree)
+                      mids = [i for i in range(1, n - 1) if i not in assign]
+                      left = [j for j in range(len(parts)) if j not in used]
+                      if mids and left and len(mids) == len(left) and 0 in assign and n - 1 in assign:
+                          if assign[0] > assign[n - 1]:
+                              left = left[::-1]
+                          for i, j in zip(mids, left):
+                              assign[i] = j
+                  if r['id'] in FERRY_DEBUG:
+                      print('DEBUG', r['id'], tags.get('name'), 'parts', parts, svc, 'isl', isl, 'fwd', info['drawn_fwd'],
+                            [(s['id'], s['name'], keep[i], own[i], assign.get(i), named_by.get(s['id'])) for i, s in enumerate(seq)])
+                  # 3. an end named after the ferry: kept only if what it names is there (Gosport Ferry Terminal)
+                  for i in ends_:
+                      s = seq[i]
+                      if not keep[i] or s['id'] in named_by or not home[i] or not (name_words(s['name']) & SERVICE_WORDS):
+                          continue
+                      c = core(s)
+                      if i in assign:
+                          keep[i] = False   # (the place's own name: Westray Ferry Terminal -> Westray)
+                      elif FN.named_elsewhere(s, c, others(i)):
+                          keep[i] = False
+                      elif any(c & town_words(parts[j]) for k, j in assign.items() if k != i):
+                          keep[i] = False   # (Glenelg-Skye Ferry, at Glenelg: Skye's the other end)
+                  # 4. names for the rest
+                  for i, s in enumerate(seq):
+                      if keep[i]:
+                          continue
+                      nm = parts[assign[i]] if i in assign else own[i]
+                      taken = [seq[k]['name'] for k in ends_ if k != i and (keep[k] or seq[k]['id'] in named_by)] \
+                          if i in ends_ else []
+                      if nm and i in assign and home[i] and FN.island_like(nm):
+                          # (an island's name, put to the end that's on it: the town there, if it's in one. St Helier
+                          # on Granville - Jersey, Douglas on Isle of Man - Liverpool; Westray still at Rapness)
+                          nm = FN.nearest(s, 1.5, ('city', 'town', 'village'), others(i), taken) or nm
+                      if not nm:
+                          if home[i]:
+                              nm = FN.name_for(s, others(i), isl, taken)
+                              # (nothing round it at all: the one place the ferry's named after, Skellig Michael)
+                              if not nm and isl and not any(clashes(isl, x) for x in taken):
+                                  nm = isl
+                          elif isl and not FN.ours(isl) and not any(same_town(isl, x) for x in taken):
+                              nm = isl
+                      if nm:
+                          if s['name'] != nm:
+                              fixed['stops named'] += 1
+                          s['name'] = nm
+                          named_by[s['id']] = r['rid']
+                  # 5. both ends named after one place (Marazion - Marazion, Sconser - Sconser): the one this named,
+                  # further from it, after what else is there, if anything
+                  a, b = seq[0], seq[-1]
+                  if n >= 2 and name_key(a['name']) == name_key(b['name']) and 0 in assign and n - 1 in assign and \
+                          assign[0] != assign[n - 1]:
+                      # (each by a different place in its name, one still named after the other's: that one's own)
+                      for i in ends_:
+                          if not same_town(seq[i]['name'], parts[assign[i]]) and seq[i]['id'] not in named_by:
+                              seq[i]['name'] = parts[assign[i]]
+                              named_by[seq[i]['id']] = r['rid']
+                              fixed['stops named apart'] += 1
+                              break
+                  if n >= 2 and name_key(a['name']) == name_key(b['name']):
+                      cand = [x for x in (a, b) if named_by.get(x['id']) == r['rid'] and is_home(x['lon'], x['lat'])]
+                      if len(cand) == 2:
+                          da, db = FN.place_dist(a, a['name'], 8.0), FN.place_dist(b, b['name'], 8.0)
+                          cand = [b] if (da is not None and (db is None or db > da)) else [a]
+                      for x in cand:
+                          o = [y for y in seq if y is not x]
+                          nm = (FN.island_at(x, 0.4, o, (x['name'],)) or FN.sight_at(x, 0.6, o, (x['name'],)) or
+                                (isl if isl and not same_town(isl, x['name']) else None) or
+                                next((p for p in parts if not same_town(p, x['name'])), None) or
+                                FN.nearest(x, 1.5, ('hamlet',), o, (x['name'],)))
+                          if nm:
+                              x['name'] = nm
+                              fixed['stops named apart'] += 1
+                              break
+                  # 7. a stop between two of one place's (Aberdeen's Ro-Ro Ramp, on the way out to Lerwick): left out
+                  merged = True
+                  while merged and len(r['stops']) > 2:
+                      merged = False
+                      sq = [stops[s] for s in r['stops']]
+                      for m in range(1, len(sq) - 1):
+                          for nb in (sq[m - 1], sq[m + 1]):
+                              if name_key(sq[m]['name']) == name_key(nb['name']) and \
+                                      hav_km((sq[m]['lon'], sq[m]['lat']), (nb['lon'], nb['lat'])) < 2.0:
+                                  merge_out_stop(r, m, stops)
+                                  fixed['stops in one place left out'] += 1
+                                  merged = True
+                                  break
+                          if merged:
+                              break
+                  keep_routes.append(r)
+
+              for r in sorted(routes, key=lambda r: r['rid']):
+                  try:
+                      one(r)
+                  except Exception as e:
+                      # (never a build stopped by one ferry's names: it keeps the ones it has, or the nearest town's)
+                      log('  a ferry named plainly, naming it went wrong:', r['id'], repr(e))
+                      for sid in r['stops']:
+                          st = stops[sid]
+                          if not st['name']:
+                              try:
+                                  if is_home(st['lon'], st['lat']):
+                                      st['name'] = FN.nearest(st, 8.0, ('city', 'town', 'village')) or ''
+                              except Exception:
+                                  pass
+                      if not any(x is r for x in keep_routes):
+                          keep_routes.append(r)
+              # its name: the ferry's own, or (none, one that says nothing, or a bit of one that goes on from a
+              # port on another region's map) its ends'
+              for r in keep_routes:
+                  info = r.pop('_f', None) or {'tags': {}, 'goes_on': False}
+                  tags = info['tags']
+                  for sid in r['stops']:
+                      if not stops[sid]['name']:
+                          stops[sid]['name'] = 'Ferry terminal'
+                  a, b = stops[r['stops'][0]]['name'], stops[r['stops'][-1]]['name']
+                  nm = clean_name(re.sub(r'^[^:]{2,40}:\s*', '', tags.get('name') or ''))
+                  if not nm or info['goes_on'] or generic_route_name(nm):
+                      good = [x for x in (a, b) if stop_name_ok(x)]
+                      if len(good) == 2 and name_key(a) != name_key(b):
+                          nm = f'{a} - {b}'
+                      elif nm and not generic_route_name(nm):
+                          pass
+                      else:
+                          nm = f'{(good or [a])[0]} ferry'
+                  r['name'] = nm[:60]
+                  r['col'] = colour_of(tags.get('colour')) or pick_colour('ferry:' + (r['ref'] or r['name']))
+              # (one that's another's other way round, or another tide's: folded into it, the one with more stops)
+              out, kept = [], []
+              try:
+                  for r in sorted(keep_routes, key=lambda r: (-len(r['stops']), -r['total'], r['rid'])):
+                      pts = [(stops[s]['lon'], stops[s]['lat']) for s in r['stops']]
+                      twin = None
+                      for k, kp in kept:
+                          if len(kp) == len(pts) and (all(hav_km(p, q) < 0.6 for p, q in zip(pts, kp)) or
+                                                      all(hav_km(p, q) < 0.6 for p, q in zip(pts, kp[::-1]))):
+                              twin = k
+                              break
+                      if twin:
+                          FERRY_ALIASES[r['id']] = twin['id']
+                          fixed['the same as another, folded into it'] += 1
+                          continue
+                      kept.append((r, pts))
+                      out.append(r)
+              except Exception as e:
+                  log('  ferries not folded together, that went wrong:', repr(e))
+                  FERRY_ALIASES.clear()
+                  out = list(keep_routes)
+              return sorted(out, key=lambda r: r['rid'])
+
+
+          def plain_ferry_names(routes, stops, FN, is_home):
+              """(if naming ferries' stops goes wrong: never a build stopped by it) what they have, else the nearest town"""
+              out = []
+              FERRY_ALIASES.clear()
+              for r in routes:
+                  try:
+                      info = r.pop('_f', None) or {}
+                      tags = info.get('tags', {})
+                      for sid in r['stops']:
+                          st = stops[sid]
+                          if not st['name']:
+                              nm = ''
+                              try:
+                                  if is_home(st['lon'], st['lat']):
+                                      nm = FN.nearest(st, 8.0, ('city', 'town', 'village')) or ''
+                              except Exception:
+                                  nm = ''
+                              st['name'] = nm or 'Ferry terminal'
+                      a, b = stops[r['stops'][0]]['name'], stops[r['stops'][-1]]['name']
+                      nm = clean_name(re.sub(r'^[^:]{2,40}:\s*', '', tags.get('name') or '')) or (f'{a} - {b}' if a != b else f'{a} ferry')
+                      r['name'] = nm[:60]
+                      r['col'] = colour_of(tags.get('colour')) or pick_colour('ferry:' + (r.get('ref') or r['name']))
+                      out.append(r)
+                  except Exception as e:
+                      log('  a ferry left out:', r.get('id'), repr(e))
+              return out
+
+
           def name_ferry_stops(routes, stops, R, is_home, region_name=''):
-              """(1.24) a ferry route relation's stops with no name: the town there, or (one on another
-              region's map) the town in the ferry's name that isn't this region's"""
+              """(1.24) a ferry route relation's stops with no name, or one that doesn't say where it is (Heysham
+              Ramp 2 - Seatruck, Berth 7): the town there; or (one on another region's map, with none) the town in
+              the ferry's name that isn't this region's"""
               FN = FerryNames(R, stops, region_name)
               n = 0
               for r in routes:
-                  if r['mode'] != 'ferry':
+                  if r['mode'] != 'ferry' or r['rid'] >= FERRY_ID_BASE:
                       continue
                   towns = split_ends(r['name'])
                   last = len(r['stops']) - 1
                   for i, sid in enumerate(r['stops']):
                       st = stops[sid]
-                      if st['name']:
+                      home = is_home(st['lon'], st['lat'])
+                      if st['name'] and (not home or stop_name_ok(st['name'], name_words(r.get('op', '')))):
                           continue
-                      if is_home(st['lon'], st['lat']):
-                          st['name'] = FN.nearest_town(st['lon'], st['lat'], 8.0) or ''
+                      if home:
+                          others = [stops[x] for x in r['stops'] if x != sid]
+                          try:
+                              st['name'] = FN.name_for(st, others) or st['name'] or ''
+                          except Exception as e:
+                              log('  a ferry stop kept its name, naming it went wrong:', sid, repr(e))
                       elif towns and i in (0, last):
                           cands = [x for x in towns if not FN.ours(x)]
                           st['name'] = cands[0] if len(cands) == 1 else towns[0 if i == 0 else 1]
@@ -2138,13 +2678,6 @@ jobs:
                           best[far[k]] = sub[a]
                           moved += 1
                   log('stops in just a country\'s border, put in the nearest council area:', moved, 'of', len(far))
-              place_of = {}
-              used = defaultdict(int)
-              by_country = defaultdict(Counter)
-              for p, a in best.items():
-                  place_of[ids[p]] = 'a' + str(cand[a][0])
-                  used[a] += 1
-                  by_country[a][country[p]] += 1
               # (stops just outside every area: the nearest one within 3 km, of their country's level)
               miss = [i for i in range(len(ids)) if i not in best]
               if miss:
@@ -2159,12 +2692,53 @@ jobs:
                       near = stree.query_nearest(pts[idx], max_distance=0.03, return_distance=False)
                       for k, a in zip(near[0].tolist(), near[1].tolist()):
                           i = idx[k]
-                          if ids[i] in place_of:
+                          if i in best:
                               continue
-                          a = sub[a]
-                          place_of[ids[i]] = 'a' + str(cand[a][0])
-                          used[a] += 1
-                          by_country[a][country[i]] += 1
+                          best[i] = sub[a]
+              # (1.24) a ferry's stop out in the water between council areas, so in just the bigger one round them,
+              # or by it (Devon round its districts: on the Dart; Connacht round its counties: off Mayo): the
+              # nearest of those, within about 10 km. Only a ferry's stops: a bus stop like that has been where it
+              # is since before
+              fonly = [p for p, a in best.items() if (stops[ids[p]].get('modes', 0) & ~STATION_BIT) == MODE_BIT['ferry']]
+              if fonly:
+                  # (each area's point inside it; one whose outline won't give one is no other's)
+                  reps, rk = [], []
+                  for k, a in enumerate(cand):
+                      try:
+                          reps.append(a[4].representative_point())
+                          rk.append(k)
+                      except Exception:
+                          pass
+                  inside = defaultdict(list)
+                  try:
+                      qi, qa = tree.query(np.array(reps, dtype=object), predicate='within')
+                      for q, a in zip(qi.tolist(), qa.tolist()):
+                          k = rk[q]
+                          if cand[k][2] > cand[a][2]:
+                              inside[a].append(k)
+                  except Exception as e:
+                      log("  ferries' stops left where they were, that went wrong:", repr(e))
+                      inside = {}
+                  moved = 0
+                  for p in fonly:
+                      try:
+                          sub = [k for k in inside.get(best[p], ()) if cand[k][2] <= PLACE_MAX_LEVEL.get(country[p], 8)]
+                          if not sub:
+                              continue
+                          dmin, k = min((cand[k][4].distance(pts[p]), k) for k in sub)
+                          if dmin <= 0.1:
+                              best[p] = k
+                              moved += 1
+                      except Exception:
+                          pass
+                  log("ferries' stops between council areas, put in the nearest:", moved, 'of', len(fonly))
+              place_of = {}
+              used = defaultdict(int)
+              by_country = defaultdict(Counter)
+              for p, a in best.items():
+                  place_of[ids[p]] = 'a' + str(cand[a][0])
+                  used[a] += 1
+                  by_country[a][country[p]] += 1
               # (an airport's place, if it has no stops)
               if extra:
                   ep = shapely.points([e[0] for e in extra], [e[1] for e in extra])
@@ -2734,6 +3308,9 @@ jobs:
               if len(built) < n0:
                   log('routes all on another region\'s map: left to it', n0 - len(built))
               routes, aliases = pick_routes(built, stops)
+              # (a ferry that's another's other way round: the one kept)
+              for k, v in FERRY_ALIASES.items():
+                  aliases.setdefault(k, aliases.get(v, v))
               name_ferry_stops(routes, stops, R, is_home, a.name or a.region)
               used = set()
               for r in routes:
