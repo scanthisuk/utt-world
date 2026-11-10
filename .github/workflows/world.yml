@@ -30,6 +30,7 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       count: ${{ steps.plan.outputs.count }}
+      polys: ${{ steps.plan.outputs.polys }}
     steps:
       - id: plan
         env:
@@ -55,6 +56,10 @@ jobs:
               ids = [ln.split('refs/heads/data-')[1] for ln in out.splitlines() if 'refs/heads/data-' in ln]
           else:
               ids = [w.strip() for w in want.split(',') if w.strip()]
+          # (1.25) the regions built so far: their edges, for each region's map to leave what's inside them to them
+          lsr = subprocess.run(['git', 'ls-remote', '--heads', 'https://github.com/' + os.environ['REPO']],
+                               capture_output=True, text=True).stdout
+          built = [ln.split('refs/heads/data-')[1] for ln in lsr.splitlines() if 'refs/heads/data-' in ln]
           inc, seen = [], set()
           for i in ids:
               p = byid.get(i)
@@ -70,6 +75,15 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write('matrix=' + json.dumps({'include': inc}) + '\n')
               f.write('count=' + str(len(inc)) + '\n')
+              polys = []
+              for i in sorted(set(built) | {x['region'] for x in inc}):
+                  p = byid.get(i)
+                  if p and 'pbf' in p.get('urls', {}):
+                      polys.append({'region': i, 'url': p['urls']['pbf'].replace('-latest.osm.pbf', '.poly')})
+              # (a world build: too many to fetch for every one)
+              if len(polys) > 20:
+                  polys = []
+              f.write('polys=' + json.dumps(polys) + '\n')
           EOF
 
   region:
@@ -85,6 +99,7 @@ jobs:
       REGION: ${{ matrix.region }}
       REGION_NAME: ${{ matrix.name }}
       REGION_URL: ${{ matrix.url }}
+      POLYS: ${{ needs.plan.outputs.polys }}
     steps:
       - name: Make room
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
@@ -98,6 +113,23 @@ jobs:
           # (the edge of the extract: the sea is only worked out inside it)
           curl -sSfL --retry 3 -A "utt-world-builder (GitHub Actions)" -o region.poly "${REGION_URL%-latest.osm.pbf}.poly" || rm -f region.poly
           ls -la region.osm.pbf region.poly || true
+          # (1.25) the world's land, roughly (Natural Earth, public domain): the sea past the edge of the map
+          curl -sSfL --retry 3 -o land.geojson "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/ca96624a56bd078437bca8184e78163e5039ad19/geojson/ne_10m_land.geojson" || rm -f land.geojson
+          # (1.25) the other regions' edges: their own maps draw what's inside them
+          mkdir -p others
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          for p in json.loads(os.environ.get('POLYS') or '[]'):
+              if p.get('region') == os.environ['REGION']:
+                  continue
+              try:
+                  req = urllib.request.Request(p['url'], headers={'User-Agent': 'utt-world-builder (GitHub Actions)'})
+                  data = urllib.request.urlopen(req, timeout=60).read()
+                  open('others/' + p['region'] + '.poly', 'wb').write(data)
+              except Exception as e:
+                  print('no edge for', p.get('region'), e)
+          EOF
+          ls -la land.geojson others || true
       - name: Build the routes
         run: |
           cat > world_build.py <<'PYEOF'
@@ -137,6 +169,7 @@ jobs:
 
 
           TZ, OZ, EXT = 12, 8, 4096
+          OMARGIN = 4    # (1.25) overview tiles past the region's stops all round (the sea round it, zoomed out)
           ROUTE_MODES = {'bus': 'bus', 'trolleybus': 'bus', 'coach': 'bus', 'minibus': 'bus', 'tram': 'tram', 'funicular': 'tram',
                          'light_rail': 'metro', 'subway': 'metro', 'monorail': 'metro', 'train': 'train', 'ferry': 'ferry'}
           MODE_BIT = {'bus': 1, 'tram': 2, 'metro': 4, 'train': 8, 'ferry': 16}
@@ -381,7 +414,10 @@ jobs:
                   # (1.24: what ferries' stops are named after)
                   return t.get('place') in MINOR_PLACES and bool(t.get('name'))
               # ways: everything matched (roads, rail, water, green, platforms); (1.24) and islands drawn as an outline,
-              # just for their names (they're left out of the coast, as before)
+              # for their names. (1.25) Every bit of coastline, whatever else it's tagged as: an island's outline, a
+              # parish boundary across a river's mouth (left out, the sea ran into the land there)
+              if t.get('natural') == 'coastline':
+                  return True
               if t.get('place') in ('island', 'islet'):
                   return bool(t.get('name')) and t.get('boundary') is None
               return t.get('place') is None and t.get('boundary') is None
@@ -440,6 +476,9 @@ jobs:
                   self.towns = []           # (name, lon, lat, place, population)
                   self.minor_places = []    # (1.24: naming ferries' stops) hamlets, islands: (name, lon, lat, place)
                   self.island_shapes = []   # islands drawn as an outline: (name, polygon, place)
+                  self.island_rels = []     # (1.25) islands drawn as a relation: (name, place, [way id, ...])
+                  self.island_way_ids = set()
+                  self.island_way_coords = {}
                   self.areas = {'w': [], 'g': [], 's': []}
                   self.lines = []           # (class, shapely LineString lon/lat)
                   self.admin = []           # (id, name, level, population, polygon)
@@ -465,6 +504,13 @@ jobs:
                           for typ, ref, role in mem:
                               if typ == 'r':
                                   self.masters[ref] = (r.id, t)
+                      elif ty == 'multipolygon' and t.get('place') in ('island', 'islet') and t.get('name'):
+                          # (1.25) an island drawn as a relation (Bressay, Inishbofin): its outline, for its name. Not the
+                          # biggest (Great Britain, Ireland: thousands of bits of coastline, and no ferry's named after them)
+                          outer = [ref for typ, ref, role in mem if typ == 'w' and role in ('outer', '')]
+                          if 0 < len(outer) <= 400:
+                              self.island_rels.append((t.get('name'), t.get('place'), outer))
+                              self.island_way_ids.update(outer)
                       elif t.get('public_transport') == 'stop_area':
                           self.stop_areas.append((r.id, t.get('name', ''), [(typ, ref) for typ, ref, role in mem if typ in ('n', 'w')]))
                           for typ, ref, role in mem:
@@ -522,8 +568,7 @@ jobs:
                                           self.island_shapes.append((t.get('name'), g, t.get('place')))
                               except Exception:
                                   pass
-                          if t.get('place') is not None:
-                              continue
+                          # (1.25) the coastline: all of it, islands' outlines too (an island left out was drawn as sea)
                           if t.get('natural') == 'coastline':
                               try:
                                   c = shapely.get_coordinates(shapely.from_wkb(wkb.create_linestring(o)))
@@ -531,6 +576,16 @@ jobs:
                                       self.coast.append(c)
                               except Exception:
                                   pass
+                          # (1.25) the outline of an island drawn as a relation: kept for its shape
+                          if o.id in self.island_way_ids:
+                              try:
+                                  c = shapely.get_coordinates(shapely.from_wkb(wkb.create_linestring(o)))
+                                  if len(c) >= 2:
+                                      self.island_way_coords[o.id] = c
+                              except Exception:
+                                  pass
+                          if t.get('place') is not None:
+                              continue
                           if hw and t.get('junction') in ('roundabout', 'circular'):
                               try:
                                   c = [(n.location.lon, n.location.lat) for n in o.nodes]
@@ -604,8 +659,27 @@ jobs:
                           if (b[2] - b[0]) * (b[3] - b[1]) < 3e-8:
                               continue
                           self.areas[k].append(g)
+                  # (1.25) islands drawn as a relation: their outlines put together
+                  n_rel = 0
+                  for nm, pl, refs in self.island_rels:
+                      try:
+                          ls = [LineString(self.island_way_coords[r]) for r in refs if r in self.island_way_coords]
+                          if not ls:
+                              continue
+                          polys = [q for q in shapely.get_parts(shapely.polygonize(ls)) if q.area > 0]
+                          if not polys:
+                              continue
+                          g = shapely.union_all(polys)
+                          if not g.is_valid:
+                              g = g.buffer(0)
+                          if not g.is_empty:
+                              self.island_shapes.append((nm, g, pl))
+                              n_rel += 1
+                      except Exception:
+                          pass
+                  self.island_way_coords = {}
                   log('nodes', len(self.nodes), 'route ways', len(self.way_geom), 'towns', len(self.towns),
-                      'hamlets and islands', len(self.minor_places), 'islands drawn', len(self.island_shapes),
+                      'hamlets and islands', len(self.minor_places), 'islands drawn', len(self.island_shapes), '(as relations', n_rel, ')',
                       'water', len(self.areas['w']), 'green', len(self.areas['g']), 'lines', len(self.lines), 'admin', len(self.admin),
                       'sights', len(self.sights), 'airports', len(self.airports), 'coastline ways', len(self.coast),
                       'ferry lines', len(self.ferry_ways))
@@ -1917,7 +1991,8 @@ jobs:
                       if small and g.area > 0.002:
                           continue
                       d = g.distance(p)
-                      if d > deg or any(g.distance(Point(o['lon'], o['lat'])) <= deg for o in others):
+                      # (1.25: one another stop's as near: not its. Noss Sound's two sides are nearer than this)
+                      if d > deg or any(g.distance(Point(o['lon'], o['lat'])) <= d + 1e-9 for o in others):
                           continue
                       # (the smallest one it's on: an island off an island)
                       if bd is None or (d, g.area) < bd:
@@ -3041,14 +3116,24 @@ jobs:
 
 
           class Sea:
-              """the sea, worked out from the coastline (OpenStreetMap draws it with the land on its left)"""
+              """the sea, worked out from the coastline (OpenStreetMap draws it with the land on its left). (1.25)
+              Past the edge of the map extract, where there's no coastline to go by: the sea round the world's land
+              (Natural Earth's, a rough outline), but not in another region's own area (its own map draws that)"""
 
-              def __init__(self, ways, edge=None):
+              def __init__(self, ways, edge=None, land=None, others=None):
+                  ways = self._join_gaps([c for c in ways if len(c) >= 2])
                   self.ways = ways
                   # (only inside the edge of the map extract: past it, there's no coastline to go by)
                   self.edge = edge
                   if edge is not None:
                       shapely.prepare(edge)
+                  self.others = others
+                  if others is not None:
+                      shapely.prepare(others)
+                  # (land None: no world land file, so nothing's drawn past the edge: it'd all be sea, France and all)
+                  self.have_land = land is not None
+                  self.land = [g for g in (land or []) if g is not None and not g.is_empty]
+                  self.land_tree = STRtree(self.land) if self.land else None
                   self.lines = [LineString(c) for c in ways]
                   self.tree = STRtree(self.lines) if self.lines else None
                   # points just either side of the whole coastline: land on the left, sea on the right
@@ -3060,6 +3145,52 @@ jobs:
                           self.kx = math.cos(math.radians(float(np.median(P[:, 1]))))
                           self.kd = cKDTree(np.column_stack([P[:, 0] * self.kx, P[:, 1]]))
                           self.klab = L
+
+              @staticmethod
+              def _join_gaps(ways, km=1.5):
+                  """(1.25) coastline that doesn't join up: a way missing where a river meets the sea (one that's a
+                  parish boundary as well, say), or two that stop just short of each other. Each loose end is joined
+                  to the nearest loose start within km, the way the coastline runs. Without it the land and the sea
+                  run into each other there: straight strips of sea across the land, or land across the sea"""
+                  if not ways:
+                      return ways
+
+                  def key(p):
+                      return (round(float(p[0]), 7), round(float(p[1]), 7))
+                  starts, ends = Counter(), Counter()
+                  for c in ways:
+                      starts[key(c[0])] += 1
+                      ends[key(c[-1])] += 1
+                  loose_end = [c[-1] for c in ways if starts[key(c[-1])] == 0]
+                  loose_start = [c[0] for c in ways if ends[key(c[0])] == 0]
+                  if not loose_end or not loose_start:
+                      return ways
+                  try:
+                      from scipy.spatial import cKDTree
+                      k = math.cos(math.radians(float(np.median([p[1] for p in loose_start]))))
+                      S = np.array([(float(p[0]) * k, float(p[1])) for p in loose_start])
+                      tree = cKDTree(S)
+                      pairs = []
+                      for i, p in enumerate(loose_end):
+                          d, j = tree.query([float(p[0]) * k, float(p[1])], k=min(4, len(S)))
+                          for dd, jj in zip(np.atleast_1d(d), np.atleast_1d(j)):
+                              if np.isfinite(dd) and dd * 111.2 <= km:
+                                  pairs.append((float(dd), i, int(jj)))
+                      pairs.sort()
+                      used_e, used_s, extra = set(), set(), []
+                      for dd, i, j in pairs:
+                          if i in used_e or j in used_s:
+                              continue
+                          used_e.add(i)
+                          used_s.add(j)
+                          a, b = loose_end[i], loose_start[j]
+                          if key(a) != key(b):
+                              extra.append(np.array([[float(a[0]), float(a[1])], [float(b[0]), float(b[1])]]))
+                      log('coastline:', len(loose_end), 'ends that join nothing,', len(extra), 'joined up to the start nearest them')
+                      return ways + extra
+                  except Exception as e:
+                      log('coastline: joining it up went wrong, as it is:', repr(e))
+                      return ways
 
               @staticmethod
               def _sides(ways, bounds=None):
@@ -3095,16 +3226,72 @@ jobs:
                       P, Lb = P[pick], Lb[pick]
                   return P, Lb
 
-              def _nearest_is_sea(self, pt):
-                  """which side of the coastline is this? (the closest point just beside the coastline says)"""
+              def _nearest_is_sea_kd(self, pt):
                   if self.kd is None:
                       return False
                   _, j = self.kd.query([pt.x * self.kx, pt.y])
                   return bool(self.klab[int(j)] == 1)
 
+              def _nearest_is_sea(self, pt):
+                  """(1.25) which side of the coastline is this? The side it's on of the bit of coastline nearest it
+                  (at a corner, both bits': inside a corner of land is land). Not the nearest of points beside it,
+                  which far inland can be one beside the water of a river's mouth, and call a whole town sea"""
+                  if self.tree is None:
+                      return False
+                  try:
+                      near = self.tree.query_nearest(pt)
+                      i = int(np.atleast_1d(near)[0])
+                      c = self.ways[i]
+                      P = np.array([pt.x, pt.y])
+                      a, b = c[:-1], c[1:]
+                      ab = b - a
+                      L2 = (ab * ab).sum(1)
+                      ap = P - a
+                      t = np.where(L2 > 0, (ap * ab).sum(1) / np.where(L2 > 0, L2, 1), 0.0)
+                      t = np.clip(t, 0.0, 1.0)
+                      proj = a + t[:, None] * ab
+                      j = int(np.argmin(((proj - P) ** 2).sum(1)))
+
+                      def side(q):
+                          return ab[q][0] * (P[1] - a[q][1]) - ab[q][1] * (P[0] - a[q][0])
+                      if t[j] <= 1e-9 and j > 0:
+                          k0, k1 = j - 1, j
+                      elif t[j] >= 1 - 1e-9 and j < len(ab) - 1:
+                          k0, k1 = j, j + 1
+                      else:
+                          return bool(side(j) < 0)
+                      s0, s1 = side(k0), side(k1)
+                      turn = ab[k0][0] * ab[k1][1] - ab[k0][1] * ab[k1][0]
+                      land = (s0 > 0 and s1 > 0) if turn > 0 else (s0 > 0 or s1 > 0)
+                      return not land
+                  except Exception:
+                      return self._nearest_is_sea_kd(pt)
+
+              def beyond(self, bb):
+                  """(1.25) the sea in a box past the edge of the map extract: round the world's land, and not in
+                  another region's own area"""
+                  if self.edge is None or not self.have_land:
+                      return []
+                  try:
+                      g = bb.difference(self.edge)
+                      if self.others is not None and not g.is_empty:
+                          g = g.difference(self.others)
+                      if g.is_empty:
+                          return []
+                      if self.land_tree is not None:
+                          near = [self.land[i] for i in self.land_tree.query(g)]
+                          if near:
+                              L = shapely.union_all([shapely.make_valid(x).intersection(bb) for x in near])
+                              if not L.is_empty:
+                                  g = g.difference(L)
+                      return [q for q in shapely.get_parts(g) if q.geom_type == 'Polygon' and q.area > 0]
+                  except Exception as e:
+                      log('  the sea past the edge of the map, in', [round(v, 3) for v in bb.bounds], 'went wrong:', repr(e))
+                      return []
+
               def in_box(self, bb):
                   out = self._in_box(bb)
-                  if self.edge is None or not out:
+                  if self.edge is None:
                       return out
                   if self.edge.contains(bb):
                       return out
@@ -3116,7 +3303,17 @@ jobs:
                           continue
                       if not g.is_empty:
                           clipped += [q for q in shapely.get_parts(g) if q.geom_type == 'Polygon' and q.area > 0]
-                  return clipped
+                  return clipped + self.beyond(bb)
+
+              def _face_is_sea(self, f, P, Lb):
+                  """a piece of the box between the coastline (and its edges): sea? By the points just beside the
+                  coastline that are in it, if they say so clearly; else by the side it's on of the coastline nearest it"""
+                  if P is not None:
+                      inside = shapely.contains_xy(f, P[:, 0], P[:, 1])
+                      ns, nl = int((Lb[inside] == 1).sum()), int((Lb[inside] == 0).sum())
+                      if ns + nl >= 3 and max(ns, nl) >= 0.8 * (ns + nl):
+                          return ns > nl
+                  return self._nearest_is_sea(f.representative_point())
 
               def _in_box(self, bb):
                   if self.tree is None:
@@ -3135,39 +3332,84 @@ jobs:
                   if not pieces:
                       return [bb] if self._nearest_is_sea(bb.centroid) else []
                   net = shapely.union_all(pieces + [bb.boundary])
-                  # (the coastline stops where the map data stops: carry its loose ends to the edge of the box)
+                  # (the coastline stops where the map data stops: carry its loose ends to the nearest edge of the
+                  # box, nearest as the crow flies, not in degrees)
                   ends = Counter()
                   for ls in getattr(net, 'geoms', [net]):
                       if ls.geom_type == 'LineString' and len(ls.coords) >= 2:
                           ends[tuple(np.round(ls.coords[0], 9))] += 1
                           ends[tuple(np.round(ls.coords[-1], 9))] += 1
                   extra = []
+                  x0, y0, x1, y1 = bb.bounds
+                  k = math.cos(math.radians((y0 + y1) / 2))
                   for pt, n in ends.items():
                       if n == 1:
-                          p = shapely.Point(pt)
-                          if bb.boundary.distance(p) > 1e-9:
-                              q = shapely.ops.nearest_points(p, bb.boundary)[1]
-                              extra.append(LineString([pt, (q.x, q.y)]))
+                          px, py = pt
+                          if bb.boundary.distance(shapely.Point(pt)) > 1e-9:
+                              d = [((px - x0) * k, (x0, py)), ((x1 - px) * k, (x1, py)), (py - y0, (px, y0)), (y1 - py, (px, y1))]
+                              q = min(d)[1]
+                              extra.append(LineString([pt, q]))
                   if extra:
                       net = shapely.union_all([net] + extra)
                   faces = [f for f in shapely.get_parts(shapely.polygonize([net])) if f.area > 0]
                   if not faces:
                       return []
                   P, Lb = self._side_samples(idx, bb)
+                  return [f for f in faces if self._face_is_sea(f, P, Lb)]
+
+
+          def load_land(path, bbox):
+              """(1.25) the world's land, roughly (Natural Earth, public domain: GeoJSON, lon/lat) inside bbox: what
+              the map shows past the edge of a region's own map. None: no file (nothing's drawn past the edge)"""
+              if not path or not os.path.exists(path):
+                  log('no world land file: past the edge of the map is left as it is')
+                  return None
+              try:
+                  doc = json.load(open(path))
+                  bb = box(*bbox)
                   out = []
-                  for f in faces:
-                      if P is None:
-                          sea = self._nearest_is_sea(f.representative_point())
-                      else:
-                          inside = shapely.contains_xy(f, P[:, 0], P[:, 1])
-                          ns, nl = int((Lb[inside] == 1).sum()), int((Lb[inside] == 0).sum())
-                          if ns + nl == 0:
-                              sea = self._nearest_is_sea(f.representative_point())
-                          else:
-                              sea = ns > nl
-                      if sea:
-                          out.append(f)
+                  for f in doc.get('features', []):
+                      g = shapely.geometry.shape(f['geometry'])
+                      for p in shapely.get_parts(g):
+                          if p.is_empty or not p.intersects(bb):
+                              continue
+                          if not p.is_valid:
+                              p = shapely.make_valid(p)
+                          c = p.intersection(bb)
+                          out += [q for q in shapely.get_parts(c) if q.geom_type == 'Polygon' and q.area > 0]
+                  log('world land pieces', len(out))
                   return out
+              except Exception as e:
+                  log('the world land file went wrong, left out:', repr(e))
+                  return None
+
+
+          def covers_all(pieces, bb):
+              """(1.25) do these shapes cover the whole box?"""
+              try:
+                  if not pieces:
+                      return False
+                  return shapely.union_all(pieces).intersection(bb).area >= bb.area * (1 - 1e-9)
+              except Exception:
+                  return False
+
+
+          def load_polys(paths):
+              """(1.25) the other regions' edges, as one shape (their own maps draw what's inside them)"""
+              gs = []
+              for p in paths or []:
+                  try:
+                      g = load_poly(p)
+                      if g is not None and not g.is_empty:
+                          gs.append(g)
+                  except Exception as e:
+                      log('  another region\'s edge, left out:', p, repr(e))
+              if not gs:
+                  return None
+              try:
+                  return shapely.union_all(gs)
+              except Exception:
+                  return None
 
 
           # ---------------------------------------------------------------- step 7: tiles
@@ -3411,6 +3653,10 @@ jobs:
               ap.add_argument('--out', required=True)
               ap.add_argument('--sea', default='')
               ap.add_argument('--poly', default='')
+              # (1.25) the world's land (Natural Earth GeoJSON): the sea past the edge of this region's map; and the
+              # other regions' edges, whose own maps draw what's inside them
+              ap.add_argument('--land', default='')
+              ap.add_argument('--others', nargs='*', default=[])
               ap.add_argument('--keep-filtered', action='store_true')
               a = ap.parse_args()
               global LOOSE_SIGHTS
@@ -3594,7 +3840,20 @@ jobs:
               lon_min, lon_max = min(lons) - 0.1, max(lons) + 0.1
               lat_min, lat_max = min(lats) - 0.1, max(lats) + 0.1
               sea = load_sea(a.sea, (lon_min, lat_min, lon_max, lat_max)) if a.sea else []
-              coast = Sea(R.coast, edge) if not sea else Sea([])
+              # (1.25) the overview tiles reach OMARGIN tiles past the region's stops all round: the sea round it, and
+              # the land over the water (roughly, from the world's land), when zoomed out. Not grey
+              ox0, oy1 = tile_of(lon_min, lat_min, OZ)
+              ox1, oy0 = tile_of(lon_max, lat_max, OZ)
+              own_range = (ox0, oy0, ox1, oy1)   # (the overview tiles over the region's own stops)
+              # (not past the edges of the world's map: no tile -1, or 256)
+              ox0, oy0 = max(0, ox0 - OMARGIN), max(0, oy0 - OMARGIN)
+              ox1, oy1 = min((1 << OZ) - 1, ox1 + OMARGIN), min((1 << OZ) - 1, oy1 + OMARGIN)
+              land = load_land(a.land, (tile_lonlat_box(ox0, oy1, OZ)[0], tile_lonlat_box(ox0, oy1, OZ)[1],
+                                        tile_lonlat_box(ox1, oy0, OZ)[2], tile_lonlat_box(ox1, oy0, OZ)[3]))
+              others = load_polys(a.others)
+              if others is not None:
+                  log('other regions\' edges', len(a.others), 'area', round(others.area, 2))
+              coast = Sea(R.coast, edge, land, others) if not sea else Sea([])
               water = R.areas['w'] + sea
               bw, bg, bs = bucket(water, TZ), bucket(R.areas['g'], TZ), bucket(R.areas['s'], TZ)
               bl = bucket(R.lines, TZ, with_cls=True)
@@ -3715,28 +3974,39 @@ jobs:
               big_g = [g for g in R.areas['g'] if (lambda b: (b[2] - b[0]) * (b[3] - b[1]))(g.bounds) > 2e-4]
               big_l = [it for it in R.lines if it[0] == 1]
               ow, og, ol = bucket(big_w, OZ), bucket(big_g, OZ), bucket(big_l, OZ, with_cls=True)
-              otiles = []
-              ox0, oy1 = tile_of(lon_min, lat_min, OZ)
-              ox1, oy0 = tile_of(lon_max, lat_max, OZ)
+              otiles, osea, oland = [], [], []
               oall = {(x, y) for x in range(ox0, ox1 + 1) for y in range(oy0, oy1 + 1)}
               for (x, y) in sorted(oall | set(tile_of(s['lon'], s['lat'], OZ) for s in home_stops.values())):
+                  obox = box(*tile_lonlat_box(x, y, OZ))
                   try:
+                      cw = coast.in_box(obox)
                       doc = {'v': 2, 'x': x, 'y': y, 'z': OZ,
-                             'w': budget_tris(layer_shape(ow.get((x, y), []) + coast.in_box(box(*tile_lonlat_box(x, y, OZ))), x, y, OZ, 2.0, 40), 2.5, 60, 700),
+                             'w': budget_tris(layer_shape(ow.get((x, y), []) + cw, x, y, OZ, 2.0, 40), 2.5, 60, 700),
                              'g': budget_tris(layer_shape(og.get((x, y)), x, y, OZ, 3.0, 400, merge=3.0), 4.0, 600, 500),
                              'l': chunked_lines(ol.get((x, y), []), x, y, OZ, 3.0, {1})}
                   except Exception as e:
                       log('  overview tile', x, y, 'failed:', e)
                       continue
-                  if doc['w'] or doc['g'] or doc['l']:
-                      write_json(os.path.join(out, 'o', str(x), f'{y}.json'), doc)
-                      otiles.append([x, y])
-              log('overview tiles', len(otiles))
+                  # (1.25) the game draws a tile no region has as open sea. One that's all sea, or has nothing in it
+                  # (land), isn't written: it's listed, and the game makes it up without fetching anything. One with
+                  # nothing in it in another region's own area isn't listed at all: that region's map has it. (All sea
+                  # over the region's own stops is written as before: the game before 1.25 only knows the files)
+                  own = own_range[0] <= x <= own_range[2] and own_range[1] <= y <= own_range[3]
+                  if not own and not doc['g'] and not doc['l'] and covers_all(cw, obox):
+                      osea.append([x, y])
+                      continue
+                  if not doc['w'] and not doc['g'] and not doc['l']:
+                      if coast.others is None or not coast.others.contains(obox):
+                          oland.append([x, y])
+                      continue
+                  write_json(os.path.join(out, 'o', str(x), f'{y}.json'), doc)
+                  otiles.append([x, y])
+              log('overview tiles', len(otiles), 'all sea', len(osea), 'all land', len(oland))
 
               bb = [e5(lat_min + 0.1), e5(lon_min + 0.1), e5(lat_max - 0.1), e5(lon_max - 0.1)]
               write_json(os.path.join(out, 'meta.json'), {
                   'v': 2, 'region': a.region, 'name': a.name or a.region, 'built': time.strftime('%Y-%m-%d'), 'bbox': bb,
-                  'tz': TZ, 'oz': OZ, 'ext': EXT, 't': tiles, 'o': otiles,
+                  'tz': TZ, 'oz': OZ, 'ext': EXT, 't': tiles, 'o': otiles, 'os': osea, 'ol': oland,
                   'counts': {'routes': len(routes), 'stops': len(home_stops), 'places': len(places), 'towns': len(tdoc),
                              'modes': dict(Counter(r['mode'] for r in routes))}})
               log('done', a.region)
@@ -3745,7 +4015,7 @@ jobs:
           if __name__ == '__main__':
               main()
           PYEOF
-          python3 world_build.py --pbf region.osm.pbf --poly region.poly --region "$REGION" --name "$REGION_NAME" --out out
+          python3 world_build.py --pbf region.osm.pbf --poly region.poly --region "$REGION" --name "$REGION_NAME" --out out --land land.geojson --others $(ls others/*.poly 2>/dev/null)
       - name: Save them
         env:
           TOKEN: ${{ github.token }}
